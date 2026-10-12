@@ -1,4 +1,4 @@
-name: Diagnose p4a
+name: Diagnose p4a master
 
 on:
   push:
@@ -12,93 +12,59 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: 克隆 p4a 并全面诊断
+      - name: 克隆 p4a master 分支并诊断
         working-directory: app
         run: |
-          set +e   # 允许命令失败，不中断
+          set +e
 
           P4A_DIR=".buildozer/android/platform/python-for-android"
           mkdir -p "$(dirname "$P4A_DIR")"
           rm -rf "$P4A_DIR"
 
-          echo ">>> 克隆 p4a..."
-          git clone https://github.com/kivy/python-for-android.git "$P4A_DIR"
+          echo ">>> 克隆 p4a 的 master 分支..."
+          git clone -b master https://github.com/kivy/python-for-android.git "$P4A_DIR"
           cd "$P4A_DIR"
 
           echo ""
           echo "=========================================="
-          echo "A. p4a 版本信息"
+          echo "A. master 分支版本"
           echo "=========================================="
           git log -1 --format="commit=%H%ndate=%ci%nsubject=%s"
-          git describe --tags 2>/dev/null || echo "(no tag)"
-          echo "--- 分支 ---"
-          git branch -a | head -20
 
           echo ""
           echo "=========================================="
-          echo "B. 全局搜索 'pip install -U pip'"
+          echo "B. master 里 'pip install -U pip' 的所在"
           echo "=========================================="
-          grep -rn "pip install -U pip" . --include="*.py" 2>/dev/null
-          echo "退出码: $?"
+          grep -rn "pip install -U pip" . --include="*.py"
 
           echo ""
           echo "=========================================="
-          echo "C. 全局搜索 'source venv'"
+          echo "C. master 里 'source venv' 的所在"
           echo "=========================================="
-          grep -rn "source venv" . --include="*.py" 2>/dev/null
-          echo "退出码: $?"
+          grep -rn "source venv" . --include="*.py"
 
           echo ""
           echo "=========================================="
-          echo "D. 全局搜索 'activate && pip'（新旧写法都查）"
+          echo "D. master 的 run_pymodules_install 函数（前后各50行）"
           echo "=========================================="
-          grep -rn "activate.*pip" . --include="*.py" 2>/dev/null
-          echo "退出码: $?"
+          grep -n "def run_pymodules_install" pythonforandroid/build.py
+
+          echo ""
+          echo "--- 850-920 行 ---"
+          sed -n '850,920p' pythonforandroid/build.py
 
           echo ""
           echo "=========================================="
-          echo "E. run_pymodules_install 函数当前完整实现"
+          echo "E. master 的 hostpython3 recipe 完整源码"
           echo "=========================================="
-          awk '/^def run_pymodules_install/,/^def [a-z]/' \
-            pythonforandroid/build.py | head -100
+          cat pythonforandroid/recipes/hostpython3/__init__.py
 
           echo ""
           echo "=========================================="
-          echo "F. python3 recipe 源码"
+          echo "F. master 的 python3 recipe 关键片段（version 和 pip 相关）"
           echo "=========================================="
-          echo "--- pythonforandroid/recipes/python3/__init__.py ---"
-          head -120 pythonforandroid/recipes/python3/__init__.py 2>/dev/null || echo "(不存在)"
-
-          echo ""
-          echo "=========================================="
-          echo "G. hostpython3 recipe 源码"
-          echo "=========================================="
-          echo "--- pythonforandroid/recipes/hostpython3/__init__.py ---"
-          cat pythonforandroid/recipes/hostpython3/__init__.py 2>/dev/null || echo "(不存在)"
-
-          echo ""
-          echo "=========================================="
-          echo "H. 所有 recipe 里包含 'pip install' 的文件"
-          echo "=========================================="
-          grep -rln "pip install" pythonforandroid/recipes/ --include="*.py" 2>/dev/null
-
-          echo ""
-          echo "=========================================="
-          echo "I. 所有 recipe 里包含 'venv' 的文件"
-          echo "=========================================="
-          grep -rln "venv" pythonforandroid/recipes/ --include="*.py" 2>/dev/null
-
-          echo ""
-          echo "=========================================="
-          echo "J. hostpython3 recipe 里所有含 'pip' 的行"
-          echo "=========================================="
-          grep -rn "pip" pythonforandroid/recipes/hostpython3/ --include="*.py" 2>/dev/null
-
-          echo ""
-          echo "=========================================="
-          echo "K. python3 recipe 里所有含 'pip' 的行"
-          echo "=========================================="
-          grep -rn "pip" pythonforandroid/recipes/python3/ --include="*.py" 2>/dev/null
+          grep -n "version\|pip\|ensurepip\|3\.1" pythonforandroid/recipes/python3/__init__.py | head -30
 
           echo ""
           echo "=== 诊断完成 ==="
+          exit 0
