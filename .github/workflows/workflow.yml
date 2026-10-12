@@ -49,30 +49,44 @@ jobs:
 
           cd "$P4A_DIR"
 
+          echo ">>> 查看 build.py 里的相关代码:"
+          grep -n "pip install" pythonforandroid/build.py | head -20
+
+          echo ""
           echo ">>> 应用补丁..."
+
           python3 << 'PYEOF'
+          import sys
+
           path = "pythonforandroid/build.py"
           with open(path, "r") as f:
-              src = f.read()
+              lines = f.readlines()
 
-          old = '"source venv/bin/activate && pip install -U pip"'
-          new = '"source venv/bin/activate"'
+          target = "pip install -U pip"
+          replacement = "echo '[patched] skip pip self-upgrade'"
 
-          if old in src:
-              src = src.replace(old, new)
-              with open(path, "w") as f:
-                  f.write(src)
-              print("✅ 补丁成功：已禁用 pip 自我升级")
-          elif new in src:
-              print("✅ 补丁已存在，跳过")
-          else:
-              print("❌ 补丁失败：未找到目标代码")
-              import sys
+          patched = 0
+          for i, line in enumerate(lines):
+              if target in line:
+                  lines[i] = line.replace(target, replacement)
+                  patched += 1
+                  print(f"  行 {i+1} 已修改:")
+                  print(f"    原: {line.rstrip()}")
+                  print(f"    新: {lines[i].rstrip()}")
+
+          if patched == 0:
+              print("❌ 未找到 'pip install -U pip'，补丁失败")
               sys.exit(1)
+
+          with open(path, "w") as f:
+              f.writelines(lines)
+
+          print(f"\n✅ 补丁成功，共修改 {patched} 处")
           PYEOF
 
+          echo ""
           echo ">>> 验证补丁结果:"
-          grep -n "source venv" pythonforandroid/build.py | head -5
+          grep -n "pip install\|patched" pythonforandroid/build.py | head -20
 
       - name: 缓存 Buildozer 产物
         uses: actions/cache@v4
