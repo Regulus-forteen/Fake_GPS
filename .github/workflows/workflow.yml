@@ -8,16 +8,44 @@ on:
 jobs:
   build-android:
     runs-on: ubuntu-latest
-    container:
-      image: kivy/buildozer:latest
+
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: 打包 APK
-        working-directory: app
+      - name: 创建缓存目录
         run: |
-          yes | buildozer android debug
+          mkdir -p ~/buildozer-cache/global
+          mkdir -p ~/buildozer-cache/local
+          chmod -R 777 ~/buildozer-cache
+
+      - name: 恢复 Buildozer 缓存
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/buildozer-cache/global
+            ~/buildozer-cache/local
+          key: buildozer-${{ github.run_id }}
+          restore-keys: |
+            buildozer-
+
+      - name: 在容器里打包
+        run: |
+          docker run --rm \
+            -v ${{ github.workspace }}/app:/home/user/hostcwd \
+            -v ~/buildozer-cache/global:/home/user/.buildozer \
+            -v ~/buildozer-cache/local:/home/user/hostcwd/.buildozer \
+            kivy/buildozer:1.5.0 \
+            bash -c "cd /home/user/hostcwd && yes | buildozer android debug"
+
+      - name: 保存 Buildozer 缓存
+        if: always()
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/buildozer-cache/global
+            ~/buildozer-cache/local
+          key: buildozer-${{ github.run_id }}
 
       - name: 上传 APK
         uses: actions/upload-artifact@v4
