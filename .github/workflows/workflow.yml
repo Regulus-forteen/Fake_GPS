@@ -8,19 +8,19 @@ on:
 jobs:
   build-android:
     runs-on: ubuntu-latest
+    container:
+      image: kivy/buildozer:latest
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: 用 Buildozer 打包
-        uses: ArtemSBulgakov/buildozer-action@v1
-        id: buildozer
-        with:
-          workdir: app
-          buildozer_version: master
+      - name: 打包 APK
+        working-directory: app
+        run: |
+          yes | buildozer android debug
 
       - name: 上传 APK
         uses: actions/upload-artifact@v4
         with:
           name: apk
-          path: ${{ steps.buildozer.outputs.filename }}
+          path: app/bin/*.apk
