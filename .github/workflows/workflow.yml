@@ -1,4 +1,4 @@
-name: Build APK
+name: Diagnose p4a
 
 on:
   push:
@@ -6,102 +6,99 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-android:
+  diagnose:
     runs-on: ubuntu-22.04
-
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: 安装系统依赖
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            git zip unzip openjdk-17-jdk \
-            autoconf automake libtool libtool-bin \
-            libltdl-dev pkg-config gettext \
-            zlib1g-dev libncurses-dev cmake \
-            libffi-dev libssl-dev
-
-      - name: 设置 Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11.5'
-
-      - name: 安装 Buildozer 和 Cython
-        run: |
-          pip install --upgrade pip
-          pip install buildozer cython==0.29.36
-
-      - name: 诊断 p4a 代码结构
+      - name: 克隆 p4a 并全面诊断
         working-directory: app
         run: |
-          set -e
+          set +e   # 允许命令失败，不中断
+
           P4A_DIR=".buildozer/android/platform/python-for-android"
           mkdir -p "$(dirname "$P4A_DIR")"
+          rm -rf "$P4A_DIR"
 
-          if [ ! -d "$P4A_DIR" ]; then
-            echo ">>> 克隆 p4a..."
-            git clone --depth=1 https://github.com/kivy/python-for-android.git "$P4A_DIR"
-          fi
-
+          echo ">>> 克隆 p4a..."
+          git clone https://github.com/kivy/python-for-android.git "$P4A_DIR"
           cd "$P4A_DIR"
 
           echo ""
           echo "=========================================="
-          echo "1. build.py 里包含 'pip' 的所有行:"
+          echo "A. p4a 版本信息"
           echo "=========================================="
-          grep -n "pip" pythonforandroid/build.py || echo "(无匹配)"
+          git log -1 --format="commit=%H%ndate=%ci%nsubject=%s"
+          git describe --tags 2>/dev/null || echo "(no tag)"
+          echo "--- 分支 ---"
+          git branch -a | head -20
 
           echo ""
           echo "=========================================="
-          echo "2. build.py 里包含 'venv' 的所有行:"
+          echo "B. 全局搜索 'pip install -U pip'"
           echo "=========================================="
-          grep -n "venv" pythonforandroid/build.py || echo "(无匹配)"
+          grep -rn "pip install -U pip" . --include="*.py" 2>/dev/null
+          echo "退出码: $?"
 
           echo ""
           echo "=========================================="
-          echo "3. run_pymodules_install 函数完整内容:"
+          echo "C. 全局搜索 'source venv'"
           echo "=========================================="
-          LINE=$(grep -n "def run_pymodules_install" pythonforandroid/build.py | head -1 | cut -d: -f1)
-          if [ -n "$LINE" ]; then
-            START=$LINE
-            END=$((LINE + 80))
-            sed -n "${START},${END}p" pythonforandroid/build.py
-          else
-            echo "(未找到该函数)"
-          fi
+          grep -rn "source venv" . --include="*.py" 2>/dev/null
+          echo "退出码: $?"
 
           echo ""
           echo "=========================================="
-          echo "4. p4a 当前 commit:"
+          echo "D. 全局搜索 'activate && pip'（新旧写法都查）"
           echo "=========================================="
-          git log -1 --oneline
+          grep -rn "activate.*pip" . --include="*.py" 2>/dev/null
+          echo "退出码: $?"
 
-          # 强制退出码 0，避免诊断失败卡住构建
-          exit 0
+          echo ""
+          echo "=========================================="
+          echo "E. run_pymodules_install 函数当前完整实现"
+          echo "=========================================="
+          awk '/^def run_pymodules_install/,/^def [a-z]/' \
+            pythonforandroid/build.py | head -100
 
-      # 下面的步骤先注释掉，等诊断结果
-      # - name: 缓存 Buildozer 产物
-      #   ...
+          echo ""
+          echo "=========================================="
+          echo "F. python3 recipe 源码"
+          echo "=========================================="
+          echo "--- pythonforandroid/recipes/python3/__init__.py ---"
+          head -120 pythonforandroid/recipes/python3/__init__.py 2>/dev/null || echo "(不存在)"
 
-      - name: 缓存 Buildozer 产物
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.buildozer
-            app/.buildozer
-          key: ${{ runner.os }}-buildozer-${{ hashFiles('app/buildozer.spec') }}
-          restore-keys: |
-            ${{ runner.os }}-buildozer-
+          echo ""
+          echo "=========================================="
+          echo "G. hostpython3 recipe 源码"
+          echo "=========================================="
+          echo "--- pythonforandroid/recipes/hostpython3/__init__.py ---"
+          cat pythonforandroid/recipes/hostpython3/__init__.py 2>/dev/null || echo "(不存在)"
 
-      - name: 打包 APK
-        working-directory: app
-        run: |
-          yes | buildozer android debug
+          echo ""
+          echo "=========================================="
+          echo "H. 所有 recipe 里包含 'pip install' 的文件"
+          echo "=========================================="
+          grep -rln "pip install" pythonforandroid/recipes/ --include="*.py" 2>/dev/null
 
-      - name: 上传 APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: apk
-          path: app/bin/*.apk
+          echo ""
+          echo "=========================================="
+          echo "I. 所有 recipe 里包含 'venv' 的文件"
+          echo "=========================================="
+          grep -rln "venv" pythonforandroid/recipes/ --include="*.py" 2>/dev/null
+
+          echo ""
+          echo "=========================================="
+          echo "J. hostpython3 recipe 里所有含 'pip' 的行"
+          echo "=========================================="
+          grep -rn "pip" pythonforandroid/recipes/hostpython3/ --include="*.py" 2>/dev/null
+
+          echo ""
+          echo "=========================================="
+          echo "K. python3 recipe 里所有含 'pip' 的行"
+          echo "=========================================="
+          grep -rn "pip" pythonforandroid/recipes/python3/ --include="*.py" 2>/dev/null
+
+          echo ""
+          echo "=== 诊断完成 ==="
