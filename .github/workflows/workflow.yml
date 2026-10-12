@@ -24,8 +24,8 @@ jobs:
           sudo apt-get install -y \
             git zip unzip openjdk-17-jdk \
             autoconf libtool pkg-config \
-            zlib1g-dev libncurses5-dev libncursesw5-dev \
-            libtinfo5 cmake libffi-dev libssl-dev
+            zlib1g-dev libncurses-dev cmake \
+            libffi-dev libssl-dev
 
       - name: 安装 Buildozer 和 Cython
         run: |
@@ -43,7 +43,7 @@ jobs:
             ${{ runner.os }}-buildozer-
 
       - name: 打包 APK
-        working-directory: app         # ← 关键：切到 app 目录
+        working-directory: app
         run: |
           yes | buildozer android debug
 
@@ -51,4 +51,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: apk
-          path: app/bin/*.apk          # ← 路径带上 app/
+          path: app/bin/*.apk
