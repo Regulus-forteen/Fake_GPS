@@ -26,12 +26,53 @@ jobs:
       - name: 设置 Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.11.5'
 
       - name: 安装 Buildozer 和 Cython
         run: |
           pip install --upgrade pip
           pip install buildozer cython==0.29.36
+
+      - name: 预先补丁 p4a（跳过 pip 自我升级）
+        working-directory: app
+        run: |
+          set -e
+          P4A_DIR=".buildozer/android/platform/python-for-android"
+          mkdir -p "$(dirname "$P4A_DIR")"
+
+          if [ ! -d "$P4A_DIR" ]; then
+            echo ">>> p4a 不存在，克隆中..."
+            git clone --depth=1 https://github.com/kivy/python-for-android.git "$P4A_DIR"
+          else
+            echo ">>> p4a 已存在，跳过克隆"
+          fi
+
+          cd "$P4A_DIR"
+
+          echo ">>> 应用补丁..."
+          python3 << 'PYEOF'
+          path = "pythonforandroid/build.py"
+          with open(path, "r") as f:
+              src = f.read()
+
+          old = '"source venv/bin/activate && pip install -U pip"'
+          new = '"source venv/bin/activate"'
+
+          if old in src:
+              src = src.replace(old, new)
+              with open(path, "w") as f:
+                  f.write(src)
+              print("✅ 补丁成功：已禁用 pip 自我升级")
+          elif new in src:
+              print("✅ 补丁已存在，跳过")
+          else:
+              print("❌ 补丁失败：未找到目标代码")
+              import sys
+              sys.exit(1)
+          PYEOF
+
+          echo ">>> 验证补丁结果:"
+          grep -n "source venv" pythonforandroid/build.py | head -5
 
       - name: 缓存 Buildozer 产物
         uses: actions/cache@v4

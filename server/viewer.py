@@ -1,14 +1,19 @@
 """
-Web 地图查看器 + 路线编辑器
+Web 地图查看器 + 路线编辑器 + 历史记录
 零第三方依赖。
 """
 
 import json
+import os
 import threading
 import time
 import urllib.request
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+
+HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "history.json")
 
 STATE = {
     "route": [],
@@ -17,6 +22,7 @@ STATE = {
     "running": False,
 }
 _lock = threading.Lock()
+_history_lock = threading.Lock()
 
 _playback_fn = None
 _playback_stop_event = threading.Event()
@@ -57,6 +63,60 @@ def _stop_playback():
     update_state(status="已停止", running=False)
 
 
+# ============================================================
+# 历史记录
+# ============================================================
+def _load_history():
+    if not os.path.exists(HISTORY_FILE):
+        return []
+    try:
+        with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            if isinstance(data, list):
+                return data
+    except Exception as e:
+        print(f"[History] 读取失败: {e}")
+    return []
+
+
+def _save_history(items):
+    try:
+        with open(HISTORY_FILE, 'w', encoding='utf-8') as f:
+            json.dump(items, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[History] 写入失败: {e}")
+
+
+def history_list():
+    with _history_lock:
+        items = _load_history()
+    items.sort(key=lambda x: x.get('time', 0), reverse=True)
+    return items
+
+
+def history_add(item):
+    with _history_lock:
+        items = _load_history()
+        item['id'] = uuid.uuid4().hex[:8]
+        item['time'] = time.time()
+        items.append(item)
+        if len(items) > 100:
+            items = items[-100:]
+        _save_history(items)
+    return item
+
+
+def history_delete(item_id):
+    with _history_lock:
+        items = _load_history()
+        items = [x for x in items if x.get('id') != item_id]
+        _save_history(items)
+    return True
+
+
+# ============================================================
+# IP 定位
+# ============================================================
 def get_ip_location():
     try:
         req = urllib.request.Request(
@@ -117,7 +177,6 @@ HTML = r"""<!DOCTYPE html>
   #locate { width: 100%; margin: 2px 0; }
   #home-info { font-size: 11px; color: #666; margin-top: 3px; word-break: break-all; }
 
-  /* 折叠的高级参数 */
   details.advanced {
     margin: 4px 0; border: 1px solid #d0d7de; border-radius: 4px;
     background: #f6f8fa;
@@ -127,28 +186,49 @@ HTML = r"""<!DOCTYPE html>
     color: #0969da; user-select: none; list-style: none;
     display: flex; align-items: center; justify-content: space-between;
   }
-  details.advanced > summary::after {
-    content: '▸'; transition: transform 0.15s;
-  }
-  details.advanced[open] > summary::after {
-    transform: rotate(90deg);
-  }
+  details.advanced > summary::after { content: '▸'; transition: transform 0.15s; }
+  details.advanced[open] > summary::after { transform: rotate(90deg); }
   details.advanced > summary::-webkit-details-marker { display: none; }
   details.advanced > div.body {
     padding: 6px 8px 8px 8px; border-top: 1px solid #d0d7de;
   }
   .param-group { margin-bottom: 6px; }
-  .param-group .label {
-    font-weight: bold; font-size: 12px; margin: 4px 0 2px 0;
-  }
+  .param-group .label { font-weight: bold; font-size: 12px; margin: 4px 0 2px 0; }
   .param-group.noise .label { color: #558b2f; }
   .param-group.timing .label { color: #1565c0; }
   .param-group .row { margin: 2px 0; font-size: 12px; }
   .param-group input[type=number] { width: 60px; padding: 2px 4px; }
   .preset-row { margin-top: 4px; }
-  .preset-row button {
-    font-size: 11px; padding: 2px 6px; margin: 1px;
+  .preset-row button { font-size: 11px; padding: 2px 6px; margin: 1px; }
+
+  details.history {
+    margin: 4px 0; border: 1px solid #f0c040; border-radius: 4px;
+    background: #fffdf5;
   }
+  details.history > summary {
+    padding: 6px 8px; cursor: pointer; font-weight: bold;
+    color: #8a6d00; user-select: none; list-style: none;
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  details.history > summary::after { content: '▸'; transition: transform 0.15s; }
+  details.history[open] > summary::after { transform: rotate(90deg); }
+  details.history > summary::-webkit-details-marker { display: none; }
+  details.history > div.body {
+    padding: 6px 8px 8px 8px; border-top: 1px solid #f0c040;
+  }
+  #history-list { max-height: 240px; overflow-y: auto; margin-top: 4px; }
+  .history-item {
+    padding: 6px; margin: 4px 0; border: 1px solid #e5e5e5;
+    border-radius: 4px; background: #fff; font-size: 12px;
+  }
+  .history-item .name { font-weight: bold; margin-bottom: 2px; }
+  .history-item .meta { color: #888; font-size: 11px; margin-bottom: 4px; }
+  .history-item .actions button {
+    padding: 2px 6px; font-size: 11px; margin-right: 3px;
+  }
+  .history-item .del { background: #fff0f0; border-color: #f0c0c0; color: #b00; }
+  #history-empty { color: #999; font-size: 11px; text-align: center; padding: 8px; }
+  #save-name { width: 100%; padding: 3px 5px; margin-top: 4px; }
 </style>
 </head>
 <body>
@@ -190,11 +270,9 @@ HTML = r"""<!DOCTYPE html>
   <div class="row">速度: <input type="number" id="speed" value="30"> km/h</div>
   <div class="row"><label><input type="checkbox" id="loop"> 循环回放</label></div>
 
-  <!-- ============ 高级参数（默认折叠） ============ -->
   <details class="advanced" id="advanced">
     <summary>⚙️ 高级参数</summary>
     <div class="body">
-
       <div class="param-group noise">
         <div class="label">随机游走（GPS 抖动）</div>
         <div class="row">横向±:
@@ -205,7 +283,6 @@ HTML = r"""<!DOCTYPE html>
           <input type="number" id="drift_max" value="3" step="0.5"> 米
         </div>
       </div>
-
       <div class="param-group timing">
         <div class="label">刷新节奏</div>
         <div class="row">间隔:
@@ -220,7 +297,6 @@ HTML = r"""<!DOCTYPE html>
           <input type="number" id="pause_max" value="4" step="0.5"> 秒
         </div>
       </div>
-
       <div class="preset-row">
         <button data-preset="phone">手机1Hz</button>
         <button data-preset="smooth">平滑</button>
@@ -228,7 +304,19 @@ HTML = r"""<!DOCTYPE html>
         <button data-preset="rough">抖动大</button>
         <button data-preset="none">无抖动</button>
       </div>
+    </div>
+  </details>
 
+  <details class="history" id="history">
+    <summary>📁 历史记录</summary>
+    <div class="body">
+      <div class="row">
+        <input type="text" id="save-name" placeholder="给这条路线起个名字">
+      </div>
+      <div class="row">
+        <button id="save-history" style="width:100%;">💾 保存当前路线</button>
+      </div>
+      <div id="history-list"></div>
     </div>
   </details>
 
@@ -278,15 +366,19 @@ let trailLine = null;
 let trailPoints = [];
 let homeMarker = null;
 
+// 画笔模式专用：实时更新的 polyline，不重建 marker
+let livePolyline = null;
+
 // ============ 渲染路线 ============
 function renderRoute() {
   routeMarkers.forEach(m => map.removeLayer(m));
   routeMarkers = [];
   if (routeLine) { map.removeLayer(routeLine); routeLine = null; }
-  if (route.length === 0) {
-    document.getElementById('count').textContent = '0';
-    return;
-  }
+
+  document.getElementById('count').textContent = route.length;
+
+  if (route.length === 0) return;
+
   route.forEach(p => {
     const m = L.circleMarker([p.lat, p.lon], {
       radius: 4, color: '#1976d2', fillColor: '#fff',
@@ -294,16 +386,15 @@ function renderRoute() {
     }).addTo(map);
     routeMarkers.push(m);
   });
+
   if (route.length >= 2) {
     const latlngs = route.map(p => [p.lat, p.lon]);
     routeLine = L.polyline(latlngs, {
       color: '#1976d2', weight: 3, opacity: 0.85
     }).addTo(map);
   }
-  document.getElementById('count').textContent = route.length;
 }
 
-// ============ 当前定位点 ============
 function updateCurrent(pt) {
   if (!pt) return;
   if (!currentMarker) {
@@ -318,7 +409,6 @@ function updateCurrent(pt) {
     pt.lat.toFixed(6) + ', ' + pt.lon.toFixed(6);
 }
 
-// ============ 尾迹 ============
 function clearTrail() {
   if (trailLine) { map.removeLayer(trailLine); trailLine = null; }
   trailPoints = [];
@@ -337,20 +427,53 @@ function addTrailPoint(pt) {
 // ============ 模式切换 ============
 const HINTS = {
   click: '单击地图加一个路径点；拖动地图正常平移',
-  draw: '按住鼠标拖动连续画点；地图已锁定，切"浏览"可平移',
+  draw: '按住鼠标拖动连续画点；地图已锁定',
   view: '正常拖动/缩放地图',
 };
+
+function disableMapInteractions() {
+  map.dragging.disable();
+  map.doubleClickZoom.disable();
+  map.scrollWheelZoom.disable();
+  map.boxZoom.disable();
+  map.keyboard.disable();
+  if (map.touchZoom) map.touchZoom.disable();
+  if (map.tap) map.tap.disable();
+}
+
+function enableMapInteractions() {
+  map.dragging.enable();
+  map.doubleClickZoom.enable();
+  map.scrollWheelZoom.enable();
+  map.boxZoom.enable();
+  map.keyboard.enable();
+  if (map.touchZoom) map.touchZoom.enable();
+  if (map.tap) map.tap.enable();
+}
+
 function setMode(m) {
+  // 切模式时清掉半截画笔
+  if (drawing) {
+    drawing = false;
+    lastDrawPoint = null;
+    if (livePolyline) {
+      map.removeLayer(livePolyline);
+      livePolyline = null;
+    }
+    renderRoute();
+  }
+
   mode = m;
   document.getElementById('mode-click').classList.toggle('active', m === 'click');
   document.getElementById('mode-draw').classList.toggle('active', m === 'draw');
   document.getElementById('mode-view').classList.toggle('active', m === 'view');
   document.getElementById('mode-hint').textContent = HINTS[m] || '';
+
   if (m === 'draw') {
-    map.dragging.disable();
+    disableMapInteractions();
     map.getContainer().style.cursor = 'crosshair';
   } else {
-    map.dragging.enable();
+    enableMapInteractions();
     map.getContainer().style.cursor =
       m === 'click' ? 'crosshair' : 'grab';
   }
@@ -368,19 +491,31 @@ function syncSimMode() {
 simCheckbox.onchange = syncSimMode;
 syncSimMode();
 
-// ============ 地图交互 ============
+// ============ 打点模式：单击加点 ============
 map.on('click', (e) => {
   if (mode !== 'click') return;
   route.push({ lat: e.latlng.lat, lon: e.latlng.lng });
   renderRoute();
 });
+
+// ============ 画笔模式：实时 polyline ============
 map.on('mousedown', (e) => {
   if (mode !== 'draw') return;
+  L.DomEvent.preventDefault(e);
   drawing = true;
   lastDrawPoint = e.containerPoint;
+
+  // 从当前 route 末尾开始一条新的实时线
+  const firstPoint = [e.latlng.lat, e.latlng.lng];
+  livePolyline = L.polyline([firstPoint], {
+    color: '#1976d2', weight: 3, opacity: 0.85
+  }).addTo(map);
+
   route.push({ lat: e.latlng.lat, lon: e.latlng.lng });
-  renderRoute();
+  // 只更新计数，不重建所有覆盖物
+  document.getElementById('count').textContent = route.length;
 });
+
 map.on('mousemove', (e) => {
   if (!drawing) return;
   if (!lastDrawPoint) { lastDrawPoint = e.containerPoint; return; }
@@ -388,14 +523,35 @@ map.on('mousemove', (e) => {
   const dy = e.containerPoint.y - lastDrawPoint.y;
   if (Math.sqrt(dx * dx + dy * dy) < DRAW_PIXEL_THRESHOLD) return;
   lastDrawPoint = e.containerPoint;
+
   route.push({ lat: e.latlng.lat, lon: e.latlng.lng });
+  if (livePolyline) {
+    livePolyline.addLatLng([e.latlng.lat, e.latlng.lng]);
+  }
+  document.getElementById('count').textContent = route.length;
+});
+
+map.on('mouseup', () => {
+  if (!drawing) return;
+  drawing = false;
+  lastDrawPoint = null;
+  if (livePolyline) {
+    map.removeLayer(livePolyline);
+    livePolyline = null;
+  }
+  // 画完一段才重建一次
   renderRoute();
 });
-map.on('mouseup', () => {
-  if (drawing) { drawing = false; lastDrawPoint = null; }
-});
+
 map.on('mouseout', () => {
-  if (drawing) { drawing = false; lastDrawPoint = null; }
+  if (!drawing) return;
+  drawing = false;
+  lastDrawPoint = null;
+  if (livePolyline) {
+    map.removeLayer(livePolyline);
+    livePolyline = null;
+  }
+  renderRoute();
 });
 
 // ============ 撤销 / 清空 ============
@@ -445,57 +601,53 @@ async function locateMe() {
   btn.textContent = '定位中…';
   btn.disabled = true;
   document.getElementById('home-info').textContent = '请求浏览器位置权限…';
+  let done = false;
   try {
     const p = await browserLocate();
     const acc = p.accuracy ? `±${Math.round(p.accuracy)}m` : '';
     showHome(p.lat, p.lon, `浏览器定位 ${acc}`);
-    return;
+    done = true;
   } catch (e) {
     document.getElementById('home-info').textContent =
       `浏览器定位失败，尝试 IP 定位…`;
   }
-  try {
-    const r = await fetch('/api/ip-location');
-    const d = await r.json();
-    if (d.ok) {
-      showHome(d.lat, d.lon,
-        `${d.city || ''} ${d.country || ''} · IP 定位（城市级）`);
-    } else {
-      document.getElementById('home-info').textContent = '定位失败';
+  if (!done) {
+    try {
+      const r = await fetch('/api/ip-location');
+      const d = await r.json();
+      if (d.ok) {
+        showHome(d.lat, d.lon,
+          `${d.city || ''} ${d.country || ''} · IP 定位（城市级）`);
+      } else {
+        document.getElementById('home-info').textContent = '定位失败';
+      }
+    } catch (e) {
+      document.getElementById('home-info').textContent = '请求失败: ' + e;
     }
-  } catch (e) {
-    document.getElementById('home-info').textContent = '请求失败: ' + e;
-  } finally {
-    btn.textContent = old;
-    btn.disabled = false;
   }
+  btn.textContent = old;
+  btn.disabled = false;
 }
 document.getElementById('locate').onclick = locateMe;
 
-// ============ 高级参数预设 ============
+// ============ 高级参数 ============
 const PRESETS = {
-  // 手机 GPS 标准：1Hz，抖动适中
   phone: {lateral_max:1, drift_min:1.5, drift_max:3,
           update_min:1.0, update_max:1.0,
           pause_prob:0, pause_min:2, pause_max:4},
-  // 平滑：抖动很小，接近理想轨迹
   smooth: {lateral_max:0.3, drift_min:0.3, drift_max:0.8,
            update_min:0.9, update_max:1.1,
            pause_prob:0, pause_min:2, pause_max:4},
-  // 高精度 5Hz
   high: {lateral_max:0.5, drift_min:0.5, drift_max:1.5,
          update_min:0.2, update_max:0.2,
          pause_prob:0, pause_min:2, pause_max:4},
-  // 抖动大：隧道/城市峡谷
   rough: {lateral_max:5, drift_min:10, drift_max:20,
           update_min:0.5, update_max:3.0,
           pause_prob:0.1, pause_min:2, pause_max:6},
-  // 无抖动：完全贴合路径
   none: {lateral_max:0, drift_min:0, drift_max:0,
          update_min:1.0, update_max:1.0,
          pause_prob:0, pause_min:2, pause_max:4},
 };
-
 function applyPreset(name) {
   const p = PRESETS[name];
   if (!p) return;
@@ -508,12 +660,10 @@ function applyPreset(name) {
   document.getElementById('pause_min').value  = p.pause_min;
   document.getElementById('pause_max').value  = p.pause_max;
 }
-
 document.querySelectorAll('.preset-row button').forEach(b => {
   b.onclick = () => applyPreset(b.dataset.preset);
 });
 
-// ============ 读取高级参数 ============
 function readAdvanced() {
   return {
     lateral_max: parseFloat(document.getElementById('lateral_max').value) || 0,
@@ -526,6 +676,107 @@ function readAdvanced() {
     pause_max: parseFloat(document.getElementById('pause_max').value) || 4,
   };
 }
+function applyAdvanced(p) {
+  document.getElementById('lateral_max').value = p.lateral_max;
+  document.getElementById('drift_min').value  = p.drift_std_min;
+  document.getElementById('drift_max').value  = p.drift_std_max;
+  document.getElementById('update_min').value = p.update_min;
+  document.getElementById('update_max').value = p.update_max;
+  document.getElementById('pause_prob').value = p.pause_prob;
+  document.getElementById('pause_min').value  = p.pause_min;
+  document.getElementById('pause_max').value  = p.pause_max;
+}
+
+// ============ 历史记录 ============
+function fmtTime(ts) {
+  const d = new Date(ts * 1000);
+  const pad = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ` +
+         `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+async function refreshHistory() {
+  const container = document.getElementById('history-list');
+  try {
+    const r = await fetch('/api/history');
+    const items = await r.json();
+    if (!items.length) {
+      container.innerHTML = '<div id="history-empty">暂无记录</div>';
+      return;
+    }
+    container.innerHTML = '';
+    items.forEach(item => {
+      const div = document.createElement('div');
+      div.className = 'history-item';
+      div.innerHTML = `
+        <div class="name">${item.name || '(未命名)'}</div>
+        <div class="meta">${fmtTime(item.time)} · ${item.route.length} 点 · ` +
+        `${item.params?.speed || 30} km/h</div>
+        <div class="actions">
+          <button class="load">加载</button>
+          <button class="del">删除</button>
+        </div>`;
+      div.querySelector('.load').onclick = () => loadHistory(item);
+      div.querySelector('.del').onclick = () => delHistory(item.id);
+      container.appendChild(div);
+    });
+  } catch (e) {
+    container.innerHTML = '<div id="history-empty">加载失败</div>';
+  }
+}
+
+function loadHistory(item) {
+  route = item.route.map(p => ({lat: p.lat, lon: p.lon}));
+  if (item.params) {
+    if (item.params.speed != null)
+      document.getElementById('speed').value = item.params.speed;
+    if (item.params.loop != null)
+      document.getElementById('loop').checked = item.params.loop;
+    if (item.params.host)
+      document.getElementById('host').value = item.params.host;
+    if (item.params.port)
+      document.getElementById('port').value = item.params.port;
+    applyAdvanced(item.params);
+  }
+  renderRoute();
+  if (routeLine) {
+    map.fitBounds(routeLine.getBounds(), { padding: [40, 40] });
+  }
+}
+
+async function delHistory(id) {
+  if (!confirm('删除这条记录？')) return;
+  await fetch('/api/history/' + id, { method: 'DELETE' });
+  refreshHistory();
+}
+
+document.getElementById('save-history').onclick = async () => {
+  if (route.length < 2) {
+    alert('至少 2 个路径点才能保存');
+    return;
+  }
+  const nameInput = document.getElementById('save-name');
+  const name = nameInput.value.trim() || `路线_${fmtTime(Date.now()/1000)}`;
+  const adv = readAdvanced();
+  const payload = {
+    name: name,
+    route: route,
+    params: {
+      speed: parseFloat(document.getElementById('speed').value),
+      loop: document.getElementById('loop').checked,
+      host: document.getElementById('host').value.trim(),
+      port: parseInt(document.getElementById('port').value),
+      ...adv,
+    },
+  };
+  await fetch('/api/history', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify(payload)
+  });
+  nameInput.value = '';
+  refreshHistory();
+};
 
 // ============ 开始 / 停止 ============
 document.getElementById('start').onclick = async () => {
@@ -578,6 +829,7 @@ setInterval(poll, 800);
 poll();
 
 setMode('click');
+refreshHistory();
 </script>
 </body>
 </html>
@@ -608,6 +860,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(get_state())
         elif self.path == '/api/ip-location':
             self._send_json(get_ip_location())
+        elif self.path == '/api/history':
+            self._send_json(history_list())
         else:
             self.send_response(404)
             self.end_headers()
@@ -636,6 +890,23 @@ class Handler(BaseHTTPRequestHandler):
             _stop_playback()
             self._send_json({"ok": True})
 
+        elif self.path == '/api/history':
+            try:
+                item = json.loads(raw.decode('utf-8'))
+                saved = history_add(item)
+                self._send_json({"ok": True, "item": saved})
+            except Exception as e:
+                self._send_json({"ok": False, "error": str(e)}, 400)
+
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_DELETE(self):
+        if self.path.startswith('/api/history/'):
+            item_id = self.path[len('/api/history/'):]
+            history_delete(item_id)
+            self._send_json({"ok": True})
         else:
             self.send_response(404)
             self.end_headers()
@@ -643,7 +914,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_OPTIONS(self):
         self.send_response(204)
         self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Methods',
+                         'GET, POST, DELETE, OPTIONS')
         self.send_header('Access-Control-Allow-Headers', 'Content-Type')
         self.end_headers()
 
