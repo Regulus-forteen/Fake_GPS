@@ -28,6 +28,12 @@ jobs:
         with:
           python-version: '3.11.5'
 
+      - name: 切换到 Java 17
+        run: |
+          echo "JAVA_HOME=/usr/lib/jvm/temurin-17-jdk-amd64" >> $GITHUB_ENV
+          echo "PATH=/usr/lib/jvm/temurin-17-jdk-amd64/bin:$PATH" >> $GITHUB_ENV
+          java -version
+
       - name: 安装 Buildozer 和 Cython
         run: |
           pip install --upgrade pip
@@ -40,57 +46,46 @@ jobs:
           P4A_DIR=".buildozer/android/platform/python-for-android"
           mkdir -p "$(dirname "$P4A_DIR")"
           rm -rf "$P4A_DIR"
-
-          echo ">>> 克隆 p4a master 分支..."
           git clone --depth=1 -b master \
             https://github.com/kivy/python-for-android.git "$P4A_DIR"
-
           cd "$P4A_DIR"
+          python3 -c "
+          path = 'pythonforandroid/build.py'
+          src = open(path).read()
+          old = '\"source venv/bin/activate && pip install -U pip\"'
+          new = '\"source venv/bin/activate\"'
+          assert old in src, '目标代码未找到'
+          open(path, 'w').write(src.replace(old, new))
+          print('✅ 补丁成功')
+          "
 
-          echo ">>> 打印目标行:"
-          sed -n '870,890p' pythonforandroid/build.py
-
-          echo ">>> 应用补丁..."
-          python3 << 'PYEOF'
-          import sys
-
-          path = "pythonforandroid/build.py"
-          with open(path, "r") as f:
-              src = f.read()
-
-          old = '"source venv/bin/activate && pip install -U pip"'
-          new = '"source venv/bin/activate"'
-
-          if old not in src:
-              print("❌ 未找到目标代码")
-              sys.exit(1)
-
-          src = src.replace(old, new)
-          with open(path, "w") as f:
-              f.write(src)
-
-          print("✅ 补丁成功")
-          PYEOF
-
-          echo ">>> 验证:"
-          sed -n '870,890p' pythonforandroid/build.py
-
-      - name: 缓存 Buildozer 产物
-        uses: actions/cache@v4
+      - name: 恢复 Buildozer 缓存
+        id: cache-restore
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/.buildozer
             app/.buildozer
-          key: ${{ runner.os }}-buildozer-v2-${{ hashFiles('app/buildozer.spec') }}
+          key: buildozer-v3-${{ hashFiles('app/buildozer.spec') }}
           restore-keys: |
-            ${{ runner.os }}-buildozer-v2-
+            buildozer-v3-
 
       - name: 打包 APK
         working-directory: app
         run: |
           yes | buildozer android debug
 
+      - name: 保存 Buildozer 缓存（即使失败也保存）
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.buildozer
+            app/.buildozer
+          key: buildozer-v3-${{ hashFiles('app/buildozer.spec') }}-${{ github.run_id }}
+
       - name: 上传 APK
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: apk
