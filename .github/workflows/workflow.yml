@@ -2,7 +2,7 @@ name: Build APK
 
 on:
   push:
-    branches: [ main ]
+    branches: [ master, main ]
   workflow_dispatch:
 
 jobs:
@@ -23,7 +23,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             git zip unzip openjdk-17-jdk \
-            autoconf libtool pkg-config \
+            autoconf automake libtool libtool-bin \
+            libltdl-dev pkg-config gettext \
             zlib1g-dev libncurses-dev cmake \
             libffi-dev libssl-dev
 
