@@ -33,7 +33,7 @@ jobs:
           pip install --upgrade pip
           pip install buildozer cython==0.29.36
 
-      - name: 预先补丁 p4a（跳过 pip 自我升级）
+      - name: 诊断 p4a 代码结构
         working-directory: app
         run: |
           set -e
@@ -41,52 +41,49 @@ jobs:
           mkdir -p "$(dirname "$P4A_DIR")"
 
           if [ ! -d "$P4A_DIR" ]; then
-            echo ">>> p4a 不存在，克隆中..."
+            echo ">>> 克隆 p4a..."
             git clone --depth=1 https://github.com/kivy/python-for-android.git "$P4A_DIR"
-          else
-            echo ">>> p4a 已存在，跳过克隆"
           fi
 
           cd "$P4A_DIR"
 
-          echo ">>> 查看 build.py 里的相关代码:"
-          grep -n "pip install" pythonforandroid/build.py | head -20
+          echo ""
+          echo "=========================================="
+          echo "1. build.py 里包含 'pip' 的所有行:"
+          echo "=========================================="
+          grep -n "pip" pythonforandroid/build.py || echo "(无匹配)"
 
           echo ""
-          echo ">>> 应用补丁..."
-
-          python3 << 'PYEOF'
-          import sys
-
-          path = "pythonforandroid/build.py"
-          with open(path, "r") as f:
-              lines = f.readlines()
-
-          target = "pip install -U pip"
-          replacement = "echo '[patched] skip pip self-upgrade'"
-
-          patched = 0
-          for i, line in enumerate(lines):
-              if target in line:
-                  lines[i] = line.replace(target, replacement)
-                  patched += 1
-                  print(f"  行 {i+1} 已修改:")
-                  print(f"    原: {line.rstrip()}")
-                  print(f"    新: {lines[i].rstrip()}")
-
-          if patched == 0:
-              print("❌ 未找到 'pip install -U pip'，补丁失败")
-              sys.exit(1)
-
-          with open(path, "w") as f:
-              f.writelines(lines)
-
-          print(f"\n✅ 补丁成功，共修改 {patched} 处")
-          PYEOF
+          echo "=========================================="
+          echo "2. build.py 里包含 'venv' 的所有行:"
+          echo "=========================================="
+          grep -n "venv" pythonforandroid/build.py || echo "(无匹配)"
 
           echo ""
-          echo ">>> 验证补丁结果:"
-          grep -n "pip install\|patched" pythonforandroid/build.py | head -20
+          echo "=========================================="
+          echo "3. run_pymodules_install 函数完整内容:"
+          echo "=========================================="
+          LINE=$(grep -n "def run_pymodules_install" pythonforandroid/build.py | head -1 | cut -d: -f1)
+          if [ -n "$LINE" ]; then
+            START=$LINE
+            END=$((LINE + 80))
+            sed -n "${START},${END}p" pythonforandroid/build.py
+          else
+            echo "(未找到该函数)"
+          fi
+
+          echo ""
+          echo "=========================================="
+          echo "4. p4a 当前 commit:"
+          echo "=========================================="
+          git log -1 --oneline
+
+          # 强制退出码 0，避免诊断失败卡住构建
+          exit 0
+
+      # 下面的步骤先注释掉，等诊断结果
+      # - name: 缓存 Buildozer 产物
+      #   ...
 
       - name: 缓存 Buildozer 产物
         uses: actions/cache@v4
