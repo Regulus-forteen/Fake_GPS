@@ -1,10 +1,5 @@
 """
 电脑端：路线回放模拟定位发送器
-- Web 编辑器里画路线 → 一键回放
-- 模拟模式：不连手机，仅网页演示
-- 也支持命令行：GPX 文件 / 内置示例路线
-- 速度波动 ±20%、高斯漂移 1.5~3m、横向偏移 ±1m
-- 随机间隔 0.6~1.8s，5% 概率长停顿 2~4s
 零第三方依赖。
 """
 
@@ -22,24 +17,41 @@ from viewer import (
 )
 
 
+DEFAULT_LATERAL_MAX = 1.0
+DEFAULT_DRIFT_STD_MIN = 1.5
+DEFAULT_DRIFT_STD_MAX = 3.0
+DEFAULT_UPDATE_MIN = 0.6
+DEFAULT_UPDATE_MAX = 1.8
+DEFAULT_PAUSE_PROB = 0.05
+DEFAULT_PAUSE_MIN = 2.0
+DEFAULT_PAUSE_MAX = 4.0
+
+
 @dataclass
 class RoutePoint:
     lat: float
     lon: float
 
 
-# ============================================================
-# 路线回放引擎
-# ============================================================
 class RoutePlaybackEngine:
     EARTH_RADIUS = 6_371_000.0
 
-    def __init__(self, path, speed_kmh, loop=False):
+    def __init__(self, path, speed_kmh, loop=False,
+                 lateral_max=DEFAULT_LATERAL_MAX,
+                 drift_std_min=DEFAULT_DRIFT_STD_MIN,
+                 drift_std_max=DEFAULT_DRIFT_STD_MAX):
         self.path = path
         self.speed_kmh = speed_kmh
         self.loop = loop
+        self.lateral_max = lateral_max
+        self.drift_std_min = drift_std_min
+        self.drift_std_max = drift_std_max
         self.traveled = 0.0
         self.total_length = self._calc_total()
+        # 平滑误差状态
+        self.drift_east = 0.0
+        self.drift_north = 0.0
+        self.lateral_offset = 0.0
 
     def _calc_total(self):
         total = 0.0
@@ -84,16 +96,31 @@ class RoutePlaybackEngine:
         lat_per_m = 1.0 / 111_320.0
         lon_per_m = 1.0 / (111_320.0 * math.cos(math.radians(base_lat)))
 
-        lateral = random.uniform(-1, 1)
+        # ---- 平滑误差：随机游走，相邻帧相关 ----
+        smooth = 0.15
+        std_dev = random.uniform(self.drift_std_min, self.drift_std_max)
 
-        std_dev = 1.5 + random.random() * 1.5
-        drift_lat = random.gauss(0, std_dev)
-        drift_lon = random.gauss(0, std_dev)
+        self.drift_east  += random.gauss(0, std_dev * smooth)
+        self.drift_north += random.gauss(0, std_dev * smooth)
+        max_drift = 3 * std_dev if std_dev > 0 else 0
+        if max_drift > 0:
+            self.drift_east  = max(-max_drift, min(max_drift, self.drift_east))
+            self.drift_north = max(-max_drift, min(max_drift, self.drift_north))
 
-        final_lat = (base_lat + perp_lat * lateral * lat_per_m +
-                     drift_lat * lat_per_m)
-        final_lon = (base_lon + perp_lon * lateral * lon_per_m +
-                     drift_lon * lon_per_m)
+        if self.lateral_max > 0:
+            self.lateral_offset += random.gauss(0, self.lateral_max * smooth)
+            self.lateral_offset = max(-self.lateral_max,
+                                      min(self.lateral_max, self.lateral_offset))
+        else:
+            self.lateral_offset = 0.0
+
+        lateral = self.lateral_offset
+        drift_lat = self.drift_north / 111_320.0
+        drift_lon = self.drift_east / (111_320.0 *
+                                       math.cos(math.radians(base_lat)))
+
+        final_lat = base_lat + perp_lat * lateral * lat_per_m + drift_lat
+        final_lon = base_lon + perp_lon * lateral * lon_per_m + drift_lon
         return RoutePoint(final_lat, final_lon)
 
     def _locate(self, distance):
@@ -107,21 +134,16 @@ class RoutePlaybackEngine:
         return self.path[-2], self.path[-1], 1.0
 
 
-# ============================================================
-# GPX 解析
-# ============================================================
 def load_gpx(filename):
     tree = ET.parse(filename)
     root = tree.getroot()
     ns = '{http://www.topografix.com/GPX/1/1}'
-
     points = []
     for trkpt in root.iter(f'{ns}trkpt'):
         lat = trkpt.get('lat')
         lon = trkpt.get('lon')
         if lat and lon:
             points.append(RoutePoint(float(lat), float(lon)))
-
     if not points:
         for trkpt in root.iter('trkpt'):
             lat = trkpt.get('lat')
@@ -141,9 +163,6 @@ def sample_route():
     ]
 
 
-# ============================================================
-# TCP 客户端
-# ============================================================
 class PhoneClient:
     def __init__(self, host, port, reconnect=True):
         self.host = host
@@ -183,12 +202,22 @@ class PhoneClient:
             self.sock = None
 
 
-# ============================================================
-# 回放核心
-# ============================================================
 def playback_loop(route_points, speed, loop, host, port,
-                  dry_run, stop_event):
-    engine = RoutePlaybackEngine(route_points, speed, loop=loop)
+                  dry_run, stop_event,
+                  lateral_max=DEFAULT_LATERAL_MAX,
+                  drift_std_min=DEFAULT_DRIFT_STD_MIN,
+                  drift_std_max=DEFAULT_DRIFT_STD_MAX,
+                  update_min=DEFAULT_UPDATE_MIN,
+                  update_max=DEFAULT_UPDATE_MAX,
+                  pause_prob=DEFAULT_PAUSE_PROB,
+                  pause_min=DEFAULT_PAUSE_MIN,
+                  pause_max=DEFAULT_PAUSE_MAX):
+    engine = RoutePlaybackEngine(
+        route_points, speed, loop=loop,
+        lateral_max=lateral_max,
+        drift_std_min=drift_std_min,
+        drift_std_max=drift_std_max,
+    )
 
     client = PhoneClient(host, port)
     if not dry_run:
@@ -211,19 +240,16 @@ def playback_loop(route_points, speed, loop, host, port,
                 print("[Main] 路线结束")
                 update_state(status="已结束", running=False)
                 break
-
             count += 1
             print(f"[{count:05d}] {pt.lat:.7f}, {pt.lon:.7f}")
-
             update_state(current={"lat": pt.lat, "lon": pt.lon})
-
             if not dry_run:
                 client.send(pt.lat, pt.lon)
 
-            if random.random() < 0.05:
-                sleep_time = random.uniform(2, 4)
+            if random.random() < pause_prob:
+                sleep_time = random.uniform(pause_min, pause_max)
             else:
-                sleep_time = random.uniform(0.6, 1.8)
+                sleep_time = random.uniform(update_min, update_max)
 
             slept = 0.0
             while slept < sleep_time and not stop_event.is_set():
@@ -244,19 +270,34 @@ def make_playback_handler():
         port = int(config.get('port', 8888))
         dry_run = bool(config.get('dry_run', False))
 
+        lateral_max = float(config.get('lateral_max', DEFAULT_LATERAL_MAX))
+        drift_std_min = float(config.get('drift_std_min', DEFAULT_DRIFT_STD_MIN))
+        drift_std_max = float(config.get('drift_std_max', DEFAULT_DRIFT_STD_MAX))
+        update_min = float(config.get('update_min', DEFAULT_UPDATE_MIN))
+        update_max = float(config.get('update_max', DEFAULT_UPDATE_MAX))
+        pause_prob = float(config.get('pause_prob', DEFAULT_PAUSE_PROB))
+        pause_min = float(config.get('pause_min', DEFAULT_PAUSE_MIN))
+        pause_max = float(config.get('pause_max', DEFAULT_PAUSE_MAX))
+
         print(f"[Web] 回放请求: {len(route_points)} 点, {speed} km/h, "
-              f"loop={loop}, 模拟={dry_run}, host={host}:{port}")
+              f"loop={loop}, 模拟={dry_run}, host={host}:{port}, "
+              f"横向±{lateral_max}m, 漂移σ∈[{drift_std_min},{drift_std_max}]m, "
+              f"间隔∈[{update_min},{update_max}]s, 停顿{ pause_prob*100:.0f}%")
 
         update_state(status="准备中")
         playback_loop(route_points, speed, loop, host, port,
-                      dry_run, stop_event)
-
+                      dry_run, stop_event,
+                      lateral_max=lateral_max,
+                      drift_std_min=drift_std_min,
+                      drift_std_max=drift_std_max,
+                      update_min=update_min,
+                      update_max=update_max,
+                      pause_prob=pause_prob,
+                      pause_min=pause_min,
+                      pause_max=pause_max)
     return handler
 
 
-# ============================================================
-# 命令行入口
-# ============================================================
 def run_cli(args):
     if args.gpx:
         print(f"[Main] 加载 GPX: {args.gpx}")
@@ -267,19 +308,24 @@ def run_cli(args):
     else:
         print("[Main] 使用内置示例路线（北京）")
         route = sample_route()
-
     print(f"[Main] 路径点: {len(route)} 个")
     print(f"[Main] 速度: {args.speed} km/h, 循环: {args.loop}")
-
     update_state(
         route=[{"lat": p.lat, "lon": p.lon} for p in route],
         status="命令行模式启动",
     )
-
     stop_event = threading.Event()
     try:
         playback_loop(route, args.speed, args.loop,
-                      args.host, args.port, args.dry_run, stop_event)
+                      args.host, args.port, args.dry_run, stop_event,
+                      lateral_max=args.lateral_max,
+                      drift_std_min=args.drift_std_min,
+                      drift_std_max=args.drift_std_max,
+                      update_min=args.update_min,
+                      update_max=args.update_max,
+                      pause_prob=args.pause_prob,
+                      pause_min=args.pause_min,
+                      pause_max=args.pause_max)
     except KeyboardInterrupt:
         print("\n[Main] 用户中断")
         stop_event.set()
@@ -295,14 +341,20 @@ def parse_args():
     p.add_argument("--loop", action="store_true")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--web-port", type=int, default=8000)
-    p.add_argument("--cli", action="store_true",
-                   help="命令行模式，不启动 Web")
+    p.add_argument("--cli", action="store_true")
+    p.add_argument("--lateral-max", type=float, default=DEFAULT_LATERAL_MAX)
+    p.add_argument("--drift-std-min", type=float, default=DEFAULT_DRIFT_STD_MIN)
+    p.add_argument("--drift-std-max", type=float, default=DEFAULT_DRIFT_STD_MAX)
+    p.add_argument("--update-min", type=float, default=DEFAULT_UPDATE_MIN)
+    p.add_argument("--update-max", type=float, default=DEFAULT_UPDATE_MAX)
+    p.add_argument("--pause-prob", type=float, default=DEFAULT_PAUSE_PROB)
+    p.add_argument("--pause-min", type=float, default=DEFAULT_PAUSE_MIN)
+    p.add_argument("--pause-max", type=float, default=DEFAULT_PAUSE_MAX)
     return p.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-
     if args.cli:
         run_cli(args)
     else:

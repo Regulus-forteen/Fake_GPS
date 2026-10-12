@@ -1,10 +1,5 @@
 """
 Web 地图查看器 + 路线编辑器
-- 打点模式：单击地图添加路径点（允许平移地图）
-- 画笔模式：按住鼠标拖动连续画点（禁用地图拖动）
-- 浏览模式：正常拖动/缩放
-- 模拟模式：不连手机，仅网页演示
-- 定位：优先用浏览器 Geolocation（Windows 位置服务），失败退回 IP 定位
 零第三方依赖。
 """
 
@@ -20,7 +15,6 @@ STATE = {
     "current": None,
     "status": "空闲",
     "running": False,
-    "home": None,
 }
 _lock = threading.Lock()
 
@@ -63,9 +57,6 @@ def _stop_playback():
     update_state(status="已停止", running=False)
 
 
-# ============================================================
-# IP 定位（仅作浏览器定位失败时的兜底）
-# ============================================================
 def get_ip_location():
     try:
         req = urllib.request.Request(
@@ -100,11 +91,12 @@ HTML = r"""<!DOCTYPE html>
   html, body, #map { height: 100%; margin: 0; }
   #toolbar {
     position: absolute; top: 10px; right: 10px; z-index: 1000;
-    background: rgba(255,255,255,0.96); padding: 10px 12px;
+    background: rgba(255,255,255,0.97); padding: 10px 12px;
     border-radius: 6px; font-family: sans-serif; font-size: 13px;
-    box-shadow: 0 1px 4px rgba(0,0,0,0.3); min-width: 240px;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.3); width: 260px;
+    max-height: calc(100vh - 30px); overflow-y: auto;
   }
-  #toolbar b { display: block; margin-bottom: 6px; }
+  #toolbar b.title { display: block; margin-bottom: 6px; font-size: 14px; }
   #toolbar button {
     margin: 2px 2px; padding: 4px 8px; cursor: pointer;
     border: 1px solid #ccc; border-radius: 4px; background: #f7f7f7;
@@ -112,7 +104,7 @@ HTML = r"""<!DOCTYPE html>
   #toolbar button.active { background: #1976d2; color: #fff; border-color: #1976d2; }
   #toolbar button:disabled { opacity: 0.5; cursor: wait; }
   #toolbar input[type=text], #toolbar input[type=number] {
-    width: 90px; padding: 3px 5px; border: 1px solid #ccc; border-radius: 3px;
+    width: 70px; padding: 3px 5px; border: 1px solid #ccc; border-radius: 3px;
   }
   #toolbar hr { border: none; border-top: 1px solid #eee; margin: 6px 0; }
   #status { color: #666; font-size: 12px; }
@@ -124,13 +116,46 @@ HTML = r"""<!DOCTYPE html>
   .home-row { margin: 4px 0; }
   #locate { width: 100%; margin: 2px 0; }
   #home-info { font-size: 11px; color: #666; margin-top: 3px; word-break: break-all; }
+
+  /* 折叠的高级参数 */
+  details.advanced {
+    margin: 4px 0; border: 1px solid #d0d7de; border-radius: 4px;
+    background: #f6f8fa;
+  }
+  details.advanced > summary {
+    padding: 6px 8px; cursor: pointer; font-weight: bold;
+    color: #0969da; user-select: none; list-style: none;
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  details.advanced > summary::after {
+    content: '▸'; transition: transform 0.15s;
+  }
+  details.advanced[open] > summary::after {
+    transform: rotate(90deg);
+  }
+  details.advanced > summary::-webkit-details-marker { display: none; }
+  details.advanced > div.body {
+    padding: 6px 8px 8px 8px; border-top: 1px solid #d0d7de;
+  }
+  .param-group { margin-bottom: 6px; }
+  .param-group .label {
+    font-weight: bold; font-size: 12px; margin: 4px 0 2px 0;
+  }
+  .param-group.noise .label { color: #558b2f; }
+  .param-group.timing .label { color: #1565c0; }
+  .param-group .row { margin: 2px 0; font-size: 12px; }
+  .param-group input[type=number] { width: 60px; padding: 2px 4px; }
+  .preset-row { margin-top: 4px; }
+  .preset-row button {
+    font-size: 11px; padding: 2px 6px; margin: 1px;
+  }
 </style>
 </head>
 <body>
 <div id="map"></div>
 
 <div id="toolbar">
-  <b>路线编辑器</b>
+  <b class="title">路线编辑器</b>
 
   <div class="row">
     <button id="mode-click">打点</button>
@@ -165,7 +190,49 @@ HTML = r"""<!DOCTYPE html>
   <div class="row">速度: <input type="number" id="speed" value="30"> km/h</div>
   <div class="row"><label><input type="checkbox" id="loop"> 循环回放</label></div>
 
-  <div class="row">
+  <!-- ============ 高级参数（默认折叠） ============ -->
+  <details class="advanced" id="advanced">
+    <summary>⚙️ 高级参数</summary>
+    <div class="body">
+
+      <div class="param-group noise">
+        <div class="label">随机游走（GPS 抖动）</div>
+        <div class="row">横向±:
+          <input type="number" id="lateral_max" value="1" step="0.5"> 米
+        </div>
+        <div class="row">漂移σ:
+          <input type="number" id="drift_min" value="1.5" step="0.5"> ~
+          <input type="number" id="drift_max" value="3" step="0.5"> 米
+        </div>
+      </div>
+
+      <div class="param-group timing">
+        <div class="label">刷新节奏</div>
+        <div class="row">间隔:
+          <input type="number" id="update_min" value="0.6" step="0.1"> ~
+          <input type="number" id="update_max" value="1.8" step="0.1"> 秒
+        </div>
+        <div class="row">停顿概率:
+          <input type="number" id="pause_prob" value="0.05" step="0.01">
+        </div>
+        <div class="row">停顿时长:
+          <input type="number" id="pause_min" value="2" step="0.5"> ~
+          <input type="number" id="pause_max" value="4" step="0.5"> 秒
+        </div>
+      </div>
+
+      <div class="preset-row">
+        <button data-preset="phone">手机1Hz</button>
+        <button data-preset="smooth">平滑</button>
+        <button data-preset="high">高精度5Hz</button>
+        <button data-preset="rough">抖动大</button>
+        <button data-preset="none">无抖动</button>
+      </div>
+
+    </div>
+  </details>
+
+  <div class="row" style="margin-top:8px;">
     <button id="start">开始回放</button>
     <button id="stop">停止</button>
   </div>
@@ -216,12 +283,10 @@ function renderRoute() {
   routeMarkers.forEach(m => map.removeLayer(m));
   routeMarkers = [];
   if (routeLine) { map.removeLayer(routeLine); routeLine = null; }
-
   if (route.length === 0) {
     document.getElementById('count').textContent = '0';
     return;
   }
-
   route.forEach(p => {
     const m = L.circleMarker([p.lat, p.lon], {
       radius: 4, color: '#1976d2', fillColor: '#fff',
@@ -229,14 +294,12 @@ function renderRoute() {
     }).addTo(map);
     routeMarkers.push(m);
   });
-
   if (route.length >= 2) {
     const latlngs = route.map(p => [p.lat, p.lon]);
     routeLine = L.polyline(latlngs, {
       color: '#1976d2', weight: 3, opacity: 0.85
     }).addTo(map);
   }
-
   document.getElementById('count').textContent = route.length;
 }
 
@@ -311,7 +374,6 @@ map.on('click', (e) => {
   route.push({ lat: e.latlng.lat, lon: e.latlng.lng });
   renderRoute();
 });
-
 map.on('mousedown', (e) => {
   if (mode !== 'draw') return;
   drawing = true;
@@ -319,7 +381,6 @@ map.on('mousedown', (e) => {
   route.push({ lat: e.latlng.lat, lon: e.latlng.lng });
   renderRoute();
 });
-
 map.on('mousemove', (e) => {
   if (!drawing) return;
   if (!lastDrawPoint) { lastDrawPoint = e.containerPoint; return; }
@@ -330,7 +391,6 @@ map.on('mousemove', (e) => {
   route.push({ lat: e.latlng.lat, lon: e.latlng.lng });
   renderRoute();
 });
-
 map.on('mouseup', () => {
   if (drawing) { drawing = false; lastDrawPoint = null; }
 });
@@ -362,7 +422,6 @@ function showHome(lat, lon, info) {
   document.getElementById('home-info').textContent =
     `${lat.toFixed(5)}, ${lon.toFixed(5)} · ${info || ''}`;
 }
-
 function browserLocate() {
   return new Promise((resolve, reject) => {
     if (!navigator.geolocation) {
@@ -380,27 +439,21 @@ function browserLocate() {
     );
   });
 }
-
 async function locateMe() {
   const btn = document.getElementById('locate');
   const old = btn.textContent;
   btn.textContent = '定位中…';
   btn.disabled = true;
   document.getElementById('home-info').textContent = '请求浏览器位置权限…';
-
-  // 1. 先试浏览器 Geolocation
   try {
     const p = await browserLocate();
     const acc = p.accuracy ? `±${Math.round(p.accuracy)}m` : '';
     showHome(p.lat, p.lon, `浏览器定位 ${acc}`);
     return;
   } catch (e) {
-    console.warn('浏览器定位失败:', e);
     document.getElementById('home-info').textContent =
-      `浏览器定位失败 (${e.message || e.code})，尝试 IP 定位…`;
+      `浏览器定位失败，尝试 IP 定位…`;
   }
-
-  // 2. 兜底：IP 定位
   try {
     const r = await fetch('/api/ip-location');
     const d = await r.json();
@@ -408,8 +461,7 @@ async function locateMe() {
       showHome(d.lat, d.lon,
         `${d.city || ''} ${d.country || ''} · IP 定位（城市级）`);
     } else {
-      document.getElementById('home-info').textContent =
-        '定位失败：浏览器拒绝 + IP 定位失败';
+      document.getElementById('home-info').textContent = '定位失败';
     }
   } catch (e) {
     document.getElementById('home-info').textContent = '请求失败: ' + e;
@@ -418,8 +470,62 @@ async function locateMe() {
     btn.disabled = false;
   }
 }
-
 document.getElementById('locate').onclick = locateMe;
+
+// ============ 高级参数预设 ============
+const PRESETS = {
+  // 手机 GPS 标准：1Hz，抖动适中
+  phone: {lateral_max:1, drift_min:1.5, drift_max:3,
+          update_min:1.0, update_max:1.0,
+          pause_prob:0, pause_min:2, pause_max:4},
+  // 平滑：抖动很小，接近理想轨迹
+  smooth: {lateral_max:0.3, drift_min:0.3, drift_max:0.8,
+           update_min:0.9, update_max:1.1,
+           pause_prob:0, pause_min:2, pause_max:4},
+  // 高精度 5Hz
+  high: {lateral_max:0.5, drift_min:0.5, drift_max:1.5,
+         update_min:0.2, update_max:0.2,
+         pause_prob:0, pause_min:2, pause_max:4},
+  // 抖动大：隧道/城市峡谷
+  rough: {lateral_max:5, drift_min:10, drift_max:20,
+          update_min:0.5, update_max:3.0,
+          pause_prob:0.1, pause_min:2, pause_max:6},
+  // 无抖动：完全贴合路径
+  none: {lateral_max:0, drift_min:0, drift_max:0,
+         update_min:1.0, update_max:1.0,
+         pause_prob:0, pause_min:2, pause_max:4},
+};
+
+function applyPreset(name) {
+  const p = PRESETS[name];
+  if (!p) return;
+  document.getElementById('lateral_max').value = p.lateral_max;
+  document.getElementById('drift_min').value  = p.drift_min;
+  document.getElementById('drift_max').value  = p.drift_max;
+  document.getElementById('update_min').value = p.update_min;
+  document.getElementById('update_max').value = p.update_max;
+  document.getElementById('pause_prob').value = p.pause_prob;
+  document.getElementById('pause_min').value  = p.pause_min;
+  document.getElementById('pause_max').value  = p.pause_max;
+}
+
+document.querySelectorAll('.preset-row button').forEach(b => {
+  b.onclick = () => applyPreset(b.dataset.preset);
+});
+
+// ============ 读取高级参数 ============
+function readAdvanced() {
+  return {
+    lateral_max: parseFloat(document.getElementById('lateral_max').value) || 0,
+    drift_std_min: parseFloat(document.getElementById('drift_min').value) || 0,
+    drift_std_max: parseFloat(document.getElementById('drift_max').value) || 0,
+    update_min: parseFloat(document.getElementById('update_min').value) || 1.0,
+    update_max: parseFloat(document.getElementById('update_max').value) || 1.0,
+    pause_prob: parseFloat(document.getElementById('pause_prob').value) || 0,
+    pause_min: parseFloat(document.getElementById('pause_min').value) || 2,
+    pause_max: parseFloat(document.getElementById('pause_max').value) || 4,
+  };
+}
 
 // ============ 开始 / 停止 ============
 document.getElementById('start').onclick = async () => {
@@ -427,14 +533,15 @@ document.getElementById('start').onclick = async () => {
     alert('请至少添加 2 个路径点');
     return;
   }
-  const isSim = simCheckbox.checked;
+  const adv = readAdvanced();
   const cfg = {
     route: route,
     host: document.getElementById('host').value.trim(),
     port: parseInt(document.getElementById('port').value),
     speed: parseFloat(document.getElementById('speed').value),
     loop: document.getElementById('loop').checked,
-    dry_run: isSim,
+    dry_run: simCheckbox.checked,
+    ...adv,
   };
   clearTrail();
   await fetch('/api/route', {
@@ -500,8 +607,7 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == '/api/state':
             self._send_json(get_state())
         elif self.path == '/api/ip-location':
-            result = get_ip_location()
-            self._send_json(result)
+            self._send_json(get_ip_location())
         else:
             self.send_response(404)
             self.end_headers()
