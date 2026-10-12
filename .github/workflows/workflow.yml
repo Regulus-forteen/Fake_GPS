@@ -7,26 +7,49 @@ on:
 
 jobs:
   build-android:
-    runs-on: ubuntu-22.04  # 关键：使用 Ubuntu 22.04 环境
+    runs-on: ubuntu-22.04
 
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
+
+      - name: 安装系统依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git zip unzip openjdk-17-jdk \
+            autoconf automake libtool libtool-bin \
+            libltdl-dev pkg-config gettext \
+            zlib1g-dev libncurses-dev cmake \
+            libffi-dev libssl-dev
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
 
       - name: 安装 Buildozer 和 Cython
         run: |
           pip install --upgrade pip
           pip install buildozer cython==0.29.36
 
-      - name: 用 Buildozer 打包
-        uses: ArtemSBulgakov/buildozer-action@v1
-        id: buildozer
+      - name: 缓存 Buildozer 产物
+        uses: actions/cache@v4
         with:
-          workdir: app
-          buildozer_version: stable
+          path: |
+            ~/.buildozer
+            app/.buildozer
+          key: ${{ runner.os }}-buildozer-${{ hashFiles('app/buildozer.spec') }}
+          restore-keys: |
+            ${{ runner.os }}-buildozer-
+
+      - name: 打包 APK
+        working-directory: app
+        run: |
+          yes | buildozer android debug
 
       - name: 上传 APK
         uses: actions/upload-artifact@v4
         with:
           name: apk
-          path: ${{ steps.buildozer.outputs.filename }}
+          path: app/bin/*.apk
