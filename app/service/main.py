@@ -47,22 +47,27 @@ class GpsServer:
         self.provider_ready = False
         self.count = 0
         self.state_file = get_state_file_path()
+        self.foreground_ok = False
 
         if IS_ANDROID:
             self.service = PythonService.mService
             self.lm = self.service.getSystemService(Context.LOCATION_SERVICE)
             self.provider = "gps"
 
-    def write_state(self, lat=None, lon=None, status="running"):
+    def write_state(self, lat=None, lon=None, status="running", extra=None):
         try:
             data = {
                 "status": status,
                 "count": self.count,
                 "timestamp": time.time(),
+                "port": self.port,
+                "foreground": self.foreground_ok,
             }
             if lat is not None and lon is not None:
                 data["lat"] = lat
                 data["lon"] = lon
+            if extra:
+                data.update(extra)
             tmp = self.state_file + ".tmp"
             with open(tmp, 'w') as f:
                 json.dump(data, f)
@@ -73,24 +78,45 @@ class GpsServer:
     def start_foreground(self):
         if not IS_ANDROID:
             print("[Service] 桌面模式，跳过前台服务")
+            self.foreground_ok = True
             return
-        if Build.VERSION.SDK_INT >= 26:
-            channel = NotificationChannel(
-                "gps_receiver", "GPS 接收器",
-                NotificationManager.IMPORTANCE_LOW
-            )
-            nm = self.service.getSystemService(Context.NOTIFICATION_SERVICE)
-            nm.createNotificationChannel(channel)
-        Icon = autoclass('android.R$drawable')
-        builder = NotificationBuilder(self.service, "gps_receiver")
-        builder.setContentTitle("GPS 接收器运行中")
-        builder.setContentText(f"监听端口 {self.port}")
-        builder.setSmallIcon(Icon.ic_menu_mylocation)
-        builder.setOngoing(True)
-        if Build.VERSION.SDK_INT >= 34:
-            self.service.startForeground(1001, builder.build(), 8)
-        else:
-            self.service.startForeground(1001, builder.build())
+
+        try:
+            if Build.VERSION.SDK_INT >= 26:
+                channel = NotificationChannel(
+                    "gps_receiver", "GPS 接收器",
+                    NotificationManager.IMPORTANCE_LOW
+                )
+                nm = self.service.getSystemService(Context.NOTIFICATION_SERVICE)
+                nm.createNotificationChannel(channel)
+
+            Icon = autoclass('android.R$drawable')
+            builder = NotificationBuilder(self.service, "gps_receiver")
+            builder.setContentTitle("GPS 接收器运行中")
+            builder.setContentText(f"监听端口 {self.port}")
+            builder.setSmallIcon(Icon.ic_menu_mylocation)
+            builder.setOngoing(True)
+            notif = builder.build()
+
+            if Build.VERSION.SDK_INT >= 34:
+                try:
+                    self.service.startForeground(1001, notif, 8)
+                    self.foreground_ok = True
+                    print("[Service] startForeground(3args) OK")
+                except Exception as e:
+                    print(f"[Service] startForeground(3args) 失败: {e}")
+                    try:
+                        self.service.startForeground(1001, notif)
+                        self.foreground_ok = True
+                        print("[Service] startForeground(2args) OK")
+                    except Exception as e2:
+                        print(f"[Service] startForeground(2args) 也失败: {e2}")
+            else:
+                self.service.startForeground(1001, notif)
+                self.foreground_ok = True
+                print("[Service] startForeground OK")
+        except Exception as e:
+            print(f"[Service] start_foreground 整体失败: {e}")
 
     def setup_provider(self):
         if not IS_ANDROID:
@@ -110,7 +136,7 @@ class GpsServer:
         except Exception as e:
             print(f"[Service] addTestProvider 失败: {e}")
             self.provider_ready = False
-            self.write_state(status=f"provider_error: {e}")
+            self.write_state(status="provider_error", extra={"error": str(e)})
 
     def inject(self, lat, lon):
         if not self.provider_ready:
@@ -134,15 +160,22 @@ class GpsServer:
         self.write_state(lat=lat, lon=lon, status="running")
 
     def serve(self):
+        self.write_state(status="starting")
         self.start_foreground()
         self.setup_provider()
 
-        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server.bind(("0.0.0.0", self.port))
-        server.listen(5)
-        print(f"[Service] 监听 0.0.0.0:{self.port}")
-        print(f"[Service] state: {self.state_file}")
+        try:
+            server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server.bind(("0.0.0.0", self.port))
+            server.listen(5)
+            print(f"[Service] 监听 0.0.0.0:{self.port}")
+            print(f"[Service] state: {self.state_file}")
+            self.write_state(status="listening")
+        except Exception as e:
+            print(f"[Service] bind 失败: {e}")
+            self.write_state(status="bind_error", extra={"error": str(e)})
+            return
 
         try:
             while self.running:

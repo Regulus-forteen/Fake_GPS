@@ -33,13 +33,8 @@ import math
 import subprocess
 import signal
 
-# 强制竖屏（Android 需要这个，Config.set 不生效）
 Window.softinput_mode = 'below_target'
-try:
-    Window.orientation = 'portrait'
-except Exception:
-    pass
-# 用 android 的 API 强制设置
+
 try:
     from android import mActivity
     from jnius import autoclass
@@ -47,7 +42,7 @@ try:
     mActivity.setRequestedOrientation(
         ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
     )
-    print("[Orientation] 已设置为竖屏")
+    print("[Orientation] 已设为竖屏")
 except Exception as e:
     print(f"[Orientation] 桌面模式: {e}")
 
@@ -75,6 +70,7 @@ COLOR_PRIMARY_DARK = (0.22, 0.48, 0.78, 1)
 COLOR_SUCCESS = (0.30, 0.85, 0.45, 1)
 COLOR_DANGER = (1.0, 0.36, 0.36, 1)
 COLOR_DANGER_DARK = (0.75, 0.25, 0.25, 1)
+COLOR_WARN = (1.0, 0.72, 0.30, 1)
 COLOR_TEXT = (0.91, 0.92, 0.94, 1)
 COLOR_TEXT_DIM = (0.55, 0.58, 0.65, 1)
 
@@ -543,7 +539,6 @@ class ReceiverUI(FloatLayout):
         )
         self.add_widget(main)
 
-        # ---------- 标题 ----------
         title_row = BoxLayout(size_hint_y=None, height=dp(36), spacing=dp(6))
         title = Label(
             text="GPS 模拟位置", font_size=dp(18),
@@ -566,7 +561,6 @@ class ReceiverUI(FloatLayout):
         title_row.add_widget(self.status_badge)
         main.add_widget(title_row)
 
-        # ---------- 状态卡片 ----------
         card = Card(size_hint_y=None, height=dp(138),
                     orientation='vertical',
                     padding=[dp(14), dp(10), dp(14), dp(10)],
@@ -590,7 +584,6 @@ class ReceiverUI(FloatLayout):
 
         main.add_widget(card)
 
-        # ---------- 地图 ----------
         map_card = Card(
             orientation='vertical',
             padding=[dp(2), dp(2), dp(2), dp(2)],
@@ -613,7 +606,6 @@ class ReceiverUI(FloatLayout):
         map_card.add_widget(map_container)
         main.add_widget(map_card)
 
-        # ---------- 图层 ----------
         self._track_line = MapTrackLayer(self.mapview)
         self.mapview.add_widget(self._track_line)
         self._track_line.pos = (0, 0)
@@ -632,7 +624,6 @@ class ReceiverUI(FloatLayout):
 
         self._map_card = map_card
 
-        # ---------- 底部 ----------
         bottom_card = Card(
             orientation='vertical',
             size_hint_y=None, height=dp(104),
@@ -686,7 +677,6 @@ class ReceiverUI(FloatLayout):
 
         main.add_widget(bottom_card)
 
-        # ---------- 悬浮按钮 ----------
         btn_size = dp(46)
         self._btn_locate = CircleIconButton(
             icon_type="locate",
@@ -711,7 +701,6 @@ class ReceiverUI(FloatLayout):
         Clock.schedule_once(self._position_buttons, 0.3)
         Clock.schedule_once(self._position_buttons, 1.0)
 
-        # ---------- 状态 ----------
         self.service_running = False
         self.state_reader = StateReader()
         self.last_count = 0
@@ -771,8 +760,8 @@ class ReceiverUI(FloatLayout):
                 self.btn.set_colors(COLOR_DANGER, COLOR_DANGER_DARK)
                 self.status_badge.text = "运行中"
                 self.status_badge.color = COLOR_SUCCESS
-                self.row_status.set_value(f"监听端口 {port}", COLOR_SUCCESS)
-                self.row_status.set_dot_color(COLOR_SUCCESS)
+                self.row_status.set_value(f"监听端口 {port}", COLOR_WARN)
+                self.row_status.set_dot_color(COLOR_WARN)
             else:
                 self.row_status.set_value("启动失败，看日志", COLOR_DANGER)
                 self.row_status.set_dot_color(COLOR_DANGER)
@@ -851,13 +840,51 @@ class ReceiverUI(FloatLayout):
                 print("[Service] 子进程已停止")
 
     def refresh(self, dt):
+        import time as _time
+
         if not self.service_running:
             self.row_ip.set_value(get_local_ip(), COLOR_PRIMARY)
             return
 
         state = self.state_reader.read()
         if not state:
+            self.row_status.set_value("service 未响应", COLOR_DANGER)
+            self.row_status.set_dot_color(COLOR_DANGER)
             return
+
+        age = _time.time() - state.get('timestamp', 0)
+        if age > 15:
+            self.row_status.set_value(f"service 已失联({int(age)}s)",
+                                      COLOR_DANGER)
+            self.row_status.set_dot_color(COLOR_DANGER)
+            return
+
+        svc_status = state.get('status', 'unknown')
+        port = state.get('port', '?')
+        if svc_status in ('ready', 'provider_ready'):
+            self.row_status.set_value(f"就绪 · 端口{port}", COLOR_SUCCESS)
+            self.row_status.set_dot_color(COLOR_SUCCESS)
+        elif svc_status == 'running':
+            self.row_status.set_value(f"运行中 · 端口{port}", COLOR_SUCCESS)
+            self.row_status.set_dot_color(COLOR_SUCCESS)
+        elif svc_status == 'listening':
+            self.row_status.set_value("监听中（等 GPS）", COLOR_WARN)
+            self.row_status.set_dot_color(COLOR_WARN)
+        elif svc_status == 'starting':
+            self.row_status.set_value("启动中...", COLOR_WARN)
+            self.row_status.set_dot_color(COLOR_WARN)
+        elif svc_status == 'provider_error':
+            self.row_status.set_value("GPS 注入权限缺失", COLOR_DANGER)
+            self.row_status.set_dot_color(COLOR_DANGER)
+        elif svc_status == 'bind_error':
+            self.row_status.set_value("端口被占用", COLOR_DANGER)
+            self.row_status.set_dot_color(COLOR_DANGER)
+        elif svc_status == 'stopped':
+            self.row_status.set_value("已停止", COLOR_TEXT_DIM)
+            self.row_status.set_dot_color(COLOR_TEXT_DIM)
+        else:
+            self.row_status.set_value(str(svc_status)[:24], COLOR_TEXT_DIM)
+            self.row_status.set_dot_color(COLOR_TEXT_DIM)
 
         raw_lat = state.get('lat')
         raw_lon = state.get('lon')
