@@ -1,5 +1,8 @@
 """
 电脑端：路线回放模拟定位发送器
+- 路线模式：沿路径移动
+- 定点模式：中心点附近随机漂移
+- 每次注入上传实际坐标给网页
 零第三方依赖。
 """
 
@@ -48,7 +51,6 @@ class RoutePlaybackEngine:
         self.drift_std_max = drift_std_max
         self.traveled = 0.0
         self.total_length = self._calc_total()
-        # 平滑误差状态
         self.drift_east = 0.0
         self.drift_north = 0.0
         self.lateral_offset = 0.0
@@ -71,42 +73,33 @@ class RoutePlaybackEngine:
     def next_point(self):
         if len(self.path) < 2:
             return None
-
         base_step = (self.speed_kmh / 3.6) * 1.0
         step = base_step * (0.8 + random.random() * 0.4)
         self.traveled += step
-
         if self.traveled >= self.total_length:
             if self.loop:
                 self.traveled %= self.total_length
             else:
                 return None
-
         seg_start, seg_end, progress = self._locate(self.traveled)
-
         base_lat = seg_start.lat + (seg_end.lat - seg_start.lat) * progress
         base_lon = seg_start.lon + (seg_end.lon - seg_start.lon) * progress
-
         dlat = seg_end.lat - seg_start.lat
         dlon = seg_end.lon - seg_start.lon
         seg_len = math.hypot(dlat, dlon) or 1e-12
         perp_lat = -dlon / seg_len
         perp_lon = dlat / seg_len
-
         lat_per_m = 1.0 / 111_320.0
         lon_per_m = 1.0 / (111_320.0 * math.cos(math.radians(base_lat)))
 
-        # ---- 平滑误差：随机游走，相邻帧相关 ----
         smooth = 0.15
         std_dev = random.uniform(self.drift_std_min, self.drift_std_max)
-
         self.drift_east  += random.gauss(0, std_dev * smooth)
         self.drift_north += random.gauss(0, std_dev * smooth)
         max_drift = 3 * std_dev if std_dev > 0 else 0
         if max_drift > 0:
-            self.drift_east  = max(-max_drift, min(max_drift, self.drift_east))
+            self.drift_east = max(-max_drift, min(max_drift, self.drift_east))
             self.drift_north = max(-max_drift, min(max_drift, self.drift_north))
-
         if self.lateral_max > 0:
             self.lateral_offset += random.gauss(0, self.lateral_max * smooth)
             self.lateral_offset = max(-self.lateral_max,
@@ -118,7 +111,6 @@ class RoutePlaybackEngine:
         drift_lat = self.drift_north / 111_320.0
         drift_lon = self.drift_east / (111_320.0 *
                                        math.cos(math.radians(base_lat)))
-
         final_lat = base_lat + perp_lat * lateral * lat_per_m + drift_lat
         final_lon = base_lon + perp_lon * lateral * lon_per_m + drift_lon
         return RoutePoint(final_lat, final_lon)
@@ -202,6 +194,27 @@ class PhoneClient:
             self.sock = None
 
 
+# ============================================================
+# 实际点上传（限流：每 3 个点更新一次 STATE）
+# ============================================================
+_actual_buffer = []
+_actual_lock = threading.Lock()
+_actual_counter = [0]
+
+
+def push_actual(lat, lon):
+    with _actual_lock:
+        _actual_buffer.append({"lat": lat, "lon": lon})
+        if len(_actual_buffer) > 2000:
+            del _actual_buffer[:-2000]
+        _actual_counter[0] += 1
+        if _actual_counter[0] % 3 == 0:
+            update_state(actual=list(_actual_buffer))
+
+
+# ============================================================
+# 路线回放
+# ============================================================
 def playback_loop(route_points, speed, loop, host, port,
                   dry_run, stop_event,
                   lateral_max=DEFAULT_LATERAL_MAX,
@@ -218,7 +231,6 @@ def playback_loop(route_points, speed, loop, host, port,
         drift_std_min=drift_std_min,
         drift_std_max=drift_std_max,
     )
-
     client = PhoneClient(host, port)
     if not dry_run:
         try:
@@ -243,6 +255,8 @@ def playback_loop(route_points, speed, loop, host, port,
             count += 1
             print(f"[{count:05d}] {pt.lat:.7f}, {pt.lon:.7f}")
             update_state(current={"lat": pt.lat, "lon": pt.lon})
+            push_actual(pt.lat, pt.lon)
+
             if not dry_run:
                 client.send(pt.lat, pt.lon)
 
@@ -250,7 +264,6 @@ def playback_loop(route_points, speed, loop, host, port,
                 sleep_time = random.uniform(pause_min, pause_max)
             else:
                 sleep_time = random.uniform(update_min, update_max)
-
             slept = 0.0
             while slept < sleep_time and not stop_event.is_set():
                 time.sleep(0.1)
@@ -260,56 +273,127 @@ def playback_loop(route_points, speed, loop, host, port,
         print(f"[Main] 共发送 {count} 个坐标")
 
 
+# ============================================================
+# 定点漂移
+# ============================================================
+def home_loop(center_lat, center_lon, host, port,
+              dry_run, stop_event,
+              drift_std=1.0, update_min=0.6, update_max=1.8):
+    client = PhoneClient(host, port)
+    if not dry_run:
+        try:
+            client.connect()
+            update_state(status="已连接手机", running=True)
+        except Exception as e:
+            print(f"[Main] 无法连接手机: {e}")
+            update_state(status=f"无法连接手机: {e}", running=False)
+            return
+    else:
+        update_state(status="定点模拟（本地演示）", running=True)
+
+    count = 0
+    dx = 0.0
+    dy = 0.0
+    lat_per_m = 1.0 / 111_320.0
+    lon_per_m = 1.0 / (111_320.0 * math.cos(math.radians(center_lat)))
+
+    try:
+        while not stop_event.is_set():
+            dx += random.gauss(0, drift_std * 0.15)
+            dy += random.gauss(0, drift_std * 0.15)
+            max_drift = 3 * drift_std
+            dx = max(-max_drift, min(max_drift, dx))
+            dy = max(-max_drift, min(max_drift, dy))
+
+            lat = center_lat + dy * lat_per_m
+            lon = center_lon + dx * lon_per_m
+
+            count += 1
+            print(f"[Home {count:05d}] {lat:.7f}, {lon:.7f}")
+            update_state(current={"lat": lat, "lon": lon})
+            push_actual(lat, lon)
+
+            if not dry_run:
+                client.send(lat, lon)
+
+            sleep_time = random.uniform(update_min, update_max)
+            slept = 0.0
+            while slept < sleep_time and not stop_event.is_set():
+                time.sleep(0.1)
+                slept += 0.1
+    finally:
+        client.close()
+        print(f"[Home] 共发送 {count} 个坐标")
+
+
+# ============================================================
+# 回放调度
+# ============================================================
 def make_playback_handler():
     def handler(config, stop_event):
+        mode = config.get('mode', 'route')
+        host = config.get('host', '192.168.1.100')
+        port = int(config.get('port', 8888))
+        dry_run = bool(config.get('dry_run', False))
+        update_min = float(config.get('update_min', DEFAULT_UPDATE_MIN))
+        update_max = float(config.get('update_max', DEFAULT_UPDATE_MAX))
+        lateral_max = float(config.get('lateral_max', DEFAULT_LATERAL_MAX))
+        drift_std_min = float(config.get('drift_std_min', DEFAULT_DRIFT_STD_MIN))
+        drift_std_max = float(config.get('drift_std_max', DEFAULT_DRIFT_STD_MAX))
+
+        # 重置 actual 缓冲
+        with _actual_lock:
+            _actual_buffer.clear()
+            _actual_counter[0] = 0
+        update_state(actual=[])
+
+        if mode == 'home':
+            home = config.get('home', {})
+            center_lat = float(home['lat'])
+            center_lon = float(home['lon'])
+            drift_std = (drift_std_min + drift_std_max) / 2
+            if drift_std <= 0:
+                drift_std = 1.0
+            print(f"[Web] 定点: ({center_lat:.6f},{center_lon:.6f}), "
+                  f"σ={drift_std}m")
+            home_loop(center_lat, center_lon, host, port,
+                      dry_run, stop_event,
+                      drift_std=drift_std,
+                      update_min=update_min, update_max=update_max)
+            return
+
+        # route 模式
         route_raw = config.get('route', [])
         route_points = [RoutePoint(p['lat'], p['lon']) for p in route_raw]
         speed = float(config.get('speed', 30.0))
         loop = bool(config.get('loop', False))
-        host = config.get('host', '192.168.1.100')
-        port = int(config.get('port', 8888))
-        dry_run = bool(config.get('dry_run', False))
-
-        lateral_max = float(config.get('lateral_max', DEFAULT_LATERAL_MAX))
-        drift_std_min = float(config.get('drift_std_min', DEFAULT_DRIFT_STD_MIN))
-        drift_std_max = float(config.get('drift_std_max', DEFAULT_DRIFT_STD_MAX))
-        update_min = float(config.get('update_min', DEFAULT_UPDATE_MIN))
-        update_max = float(config.get('update_max', DEFAULT_UPDATE_MAX))
         pause_prob = float(config.get('pause_prob', DEFAULT_PAUSE_PROB))
         pause_min = float(config.get('pause_min', DEFAULT_PAUSE_MIN))
         pause_max = float(config.get('pause_max', DEFAULT_PAUSE_MAX))
 
-        print(f"[Web] 回放请求: {len(route_points)} 点, {speed} km/h, "
-              f"loop={loop}, 模拟={dry_run}, host={host}:{port}, "
-              f"横向±{lateral_max}m, 漂移σ∈[{drift_std_min},{drift_std_max}]m, "
-              f"间隔∈[{update_min},{update_max}]s, 停顿{ pause_prob*100:.0f}%")
-
-        update_state(status="准备中")
+        print(f"[Web] 路线: {len(route_points)} 点, {speed} km/h, loop={loop}")
         playback_loop(route_points, speed, loop, host, port,
                       dry_run, stop_event,
                       lateral_max=lateral_max,
                       drift_std_min=drift_std_min,
                       drift_std_max=drift_std_max,
-                      update_min=update_min,
-                      update_max=update_max,
+                      update_min=update_min, update_max=update_max,
                       pause_prob=pause_prob,
-                      pause_min=pause_min,
-                      pause_max=pause_max)
+                      pause_min=pause_min, pause_max=pause_max)
     return handler
 
 
+# ============================================================
+# 命令行入口
+# ============================================================
 def run_cli(args):
     if args.gpx:
-        print(f"[Main] 加载 GPX: {args.gpx}")
         route = load_gpx(args.gpx)
         if len(route) < 2:
             print("[Main] GPX 里没有足够的 trkpt，退出")
             return
     else:
-        print("[Main] 使用内置示例路线（北京）")
         route = sample_route()
-    print(f"[Main] 路径点: {len(route)} 个")
-    print(f"[Main] 速度: {args.speed} km/h, 循环: {args.loop}")
     update_state(
         route=[{"lat": p.lat, "lon": p.lon} for p in route],
         status="命令行模式启动",
@@ -317,17 +401,8 @@ def run_cli(args):
     stop_event = threading.Event()
     try:
         playback_loop(route, args.speed, args.loop,
-                      args.host, args.port, args.dry_run, stop_event,
-                      lateral_max=args.lateral_max,
-                      drift_std_min=args.drift_std_min,
-                      drift_std_max=args.drift_std_max,
-                      update_min=args.update_min,
-                      update_max=args.update_max,
-                      pause_prob=args.pause_prob,
-                      pause_min=args.pause_min,
-                      pause_max=args.pause_max)
+                      args.host, args.port, args.dry_run, stop_event)
     except KeyboardInterrupt:
-        print("\n[Main] 用户中断")
         stop_event.set()
         update_state(status="已中断", running=False)
 
@@ -342,14 +417,6 @@ def parse_args():
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--web-port", type=int, default=8000)
     p.add_argument("--cli", action="store_true")
-    p.add_argument("--lateral-max", type=float, default=DEFAULT_LATERAL_MAX)
-    p.add_argument("--drift-std-min", type=float, default=DEFAULT_DRIFT_STD_MIN)
-    p.add_argument("--drift-std-max", type=float, default=DEFAULT_DRIFT_STD_MAX)
-    p.add_argument("--update-min", type=float, default=DEFAULT_UPDATE_MIN)
-    p.add_argument("--update-max", type=float, default=DEFAULT_UPDATE_MAX)
-    p.add_argument("--pause-prob", type=float, default=DEFAULT_PAUSE_PROB)
-    p.add_argument("--pause-min", type=float, default=DEFAULT_PAUSE_MIN)
-    p.add_argument("--pause-max", type=float, default=DEFAULT_PAUSE_MAX)
     return p.parse_args()
 
 
@@ -361,8 +428,7 @@ if __name__ == "__main__":
         if args.web_port > 0:
             set_playback_handler(make_playback_handler())
             start_server(args.web_port)
-            print(f"\n浏览器打开: http://localhost:{args.web_port}")
-            print("画好路线 → 勾选模拟模式 → 开始回放\n")
+            print(f"\n浏览器打开: http://localhost:{args.web_port}\n")
             try:
                 while True:
                     time.sleep(1)

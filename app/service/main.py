@@ -1,39 +1,79 @@
 """
-前台服务：TCP 监听 + GPS 注入。
-电脑端发 "lat,lon\n"，本服务逐行解析并注入。
+前台服务（跨平台）
+- Android: 监听 TCP + 注入 GPS + 写 state.json
+- 桌面: 监听 TCP + 只写 state.json
 """
 import os
 import sys
 import socket
 import threading
 import time
+import json
+import argparse
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+IS_ANDROID = ('ANDROID_ARGUMENT' in os.environ or
+              'ANDROID_PRIVATE' in os.environ)
 
-from jnius import autoclass
+if IS_ANDROID:
+    from jnius import autoclass
+    Context = autoclass('android.content.Context')
+    LocationManager = autoclass('android.location.LocationManager')
+    Location = autoclass('android.location.Location')
+    SystemClock = autoclass('android.os.SystemClock')
+    NotificationBuilder = autoclass('android.app.Notification$Builder')
+    NotificationChannel = autoclass('android.app.NotificationChannel')
+    NotificationManager = autoclass('android.app.NotificationManager')
+    Build = autoclass('android.os.Build')
+    PythonService = autoclass('org.kivy.android.PythonService')
 
-Context = autoclass('android.content.Context')
-LocationManager = autoclass('android.location.LocationManager')
-Location = autoclass('android.location.Location')
-SystemClock = autoclass('android.os.SystemClock')
-NotificationBuilder = autoclass('android.app.Notification$Builder')
-NotificationChannel = autoclass('android.app.NotificationChannel')
-NotificationManager = autoclass('android.app.NotificationManager')
-Build = autoclass('android.os.Build')
-PythonService = autoclass('org.kivy.android.PythonService')
+
+def get_state_file_path():
+    if IS_ANDROID:
+        try:
+            files_dir = PythonService.mService.getFilesDir().getAbsolutePath()
+            return os.path.join(files_dir, 'state.json')
+        except Exception as e:
+            print(f"[Path] {e}")
+    return os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        'state.json'
+    )
 
 
 class GpsServer:
     def __init__(self, port=8888):
         self.port = port
         self.running = True
-        self.service = PythonService.mService   # 关键：用服务自身作为 Context
-        self.lm = self.service.getSystemService(Context.LOCATION_SERVICE)
-        self.provider = "gps"
         self.provider_ready = False
+        self.count = 0
+        self.state_file = get_state_file_path()
 
-    # ---- 前台服务通知 ----
+        if IS_ANDROID:
+            self.service = PythonService.mService
+            self.lm = self.service.getSystemService(Context.LOCATION_SERVICE)
+            self.provider = "gps"
+
+    def write_state(self, lat=None, lon=None, status="running"):
+        try:
+            data = {
+                "status": status,
+                "count": self.count,
+                "timestamp": time.time(),
+            }
+            if lat is not None and lon is not None:
+                data["lat"] = lat
+                data["lon"] = lon
+            tmp = self.state_file + ".tmp"
+            with open(tmp, 'w') as f:
+                json.dump(data, f)
+            os.replace(tmp, self.state_file)
+        except Exception as e:
+            print(f"[Service] 写状态失败: {e}")
+
     def start_foreground(self):
+        if not IS_ANDROID:
+            print("[Service] 桌面模式，跳过前台服务")
+            return
         if Build.VERSION.SDK_INT >= 26:
             channel = NotificationChannel(
                 "gps_receiver", "GPS 接收器",
@@ -41,22 +81,22 @@ class GpsServer:
             )
             nm = self.service.getSystemService(Context.NOTIFICATION_SERVICE)
             nm.createNotificationChannel(channel)
-
         Icon = autoclass('android.R$drawable')
         builder = NotificationBuilder(self.service, "gps_receiver")
         builder.setContentTitle("GPS 接收器运行中")
         builder.setContentText(f"监听端口 {self.port}")
         builder.setSmallIcon(Icon.ic_menu_mylocation)
         builder.setOngoing(True)
-
         if Build.VERSION.SDK_INT >= 34:
-            # FOREGROUND_SERVICE_TYPE_LOCATION = 8
             self.service.startForeground(1001, builder.build(), 8)
         else:
             self.service.startForeground(1001, builder.build())
 
-    # ---- 测试 Provider ----
     def setup_provider(self):
+        if not IS_ANDROID:
+            self.provider_ready = True
+            self.write_state(status="ready")
+            return
         try:
             self.lm.addTestProvider(
                 self.provider,
@@ -65,27 +105,34 @@ class GpsServer:
             )
             self.lm.setTestProviderEnabled(self.provider, True)
             self.provider_ready = True
-            print("[Service] 测试 Provider 注册成功")
+            print("[Service] Provider 注册成功")
+            self.write_state(status="provider_ready")
         except Exception as e:
             print(f"[Service] addTestProvider 失败: {e}")
             self.provider_ready = False
+            self.write_state(status=f"provider_error: {e}")
 
     def inject(self, lat, lon):
         if not self.provider_ready:
             return
-        try:
-            loc = Location(self.provider)
-            loc.setLatitude(lat)
-            loc.setLongitude(lon)
-            loc.setAccuracy(3.0)
-            loc.setAltitude(50.0)
-            loc.setTime(System.currentTimeMillis())
-            loc.setElapsedRealtimeNanos(SystemClock.elapsedRealtimeNanos())
-            self.lm.setTestProviderLocation(self.provider, loc)
-        except Exception as e:
-            print(f"[Service] 注入失败: {e}")
+        self.count += 1
+        if IS_ANDROID:
+            try:
+                loc = Location(self.provider)
+                loc.setLatitude(lat)
+                loc.setLongitude(lon)
+                loc.setAccuracy(3.0)
+                loc.setAltitude(50.0)
+                loc.setTime(System.currentTimeMillis())
+                loc.setElapsedRealtimeNanos(SystemClock.elapsedRealtimeNanos())
+                self.lm.setTestProviderLocation(self.provider, loc)
+            except Exception as e:
+                print(f"[Service] 注入失败: {e}")
+        else:
+            if self.count % 10 == 1:
+                print(f"[Service] #{self.count}: {lat:.6f}, {lon:.6f}")
+        self.write_state(lat=lat, lon=lon, status="running")
 
-    # ---- TCP 服务器 ----
     def serve(self):
         self.start_foreground()
         self.setup_provider()
@@ -94,26 +141,25 @@ class GpsServer:
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server.bind(("0.0.0.0", self.port))
         server.listen(5)
-        server.settimeout(1.0)
         print(f"[Service] 监听 0.0.0.0:{self.port}")
+        print(f"[Service] state: {self.state_file}")
 
-        while self.running:
-            try:
-                conn, addr = server.accept()
+        try:
+            while self.running:
+                try:
+                    conn, addr = server.accept()
+                except KeyboardInterrupt:
+                    break
                 print(f"[Service] 客户端连接: {addr}")
-                threading.Thread(
-                    target=self.handle_client, args=(conn,), daemon=True
-                ).start()
-            except socket.timeout:
-                continue
-            except Exception as e:
-                print(f"[Service] accept 异常: {e}")
-                break
-
-        server.close()
+                threading.Thread(target=self.handle_client,
+                                 args=(conn,), daemon=True).start()
+        except KeyboardInterrupt:
+            print("\n[Service] Ctrl+C")
+        finally:
+            server.close()
+            self.stop()
 
     def handle_client(self, conn):
-        """逐行读取 'lat,lon' 并注入"""
         buffer = ""
         try:
             while self.running:
@@ -128,36 +174,38 @@ class GpsServer:
                         continue
                     try:
                         lat_str, lon_str = line.split(",")
-                        lat, lon = float(lat_str), float(lon_str)
-                        self.inject(lat, lon)
+                        self.inject(float(lat_str), float(lon_str))
                     except ValueError:
                         print(f"[Service] 格式错误: {line}")
         except Exception as e:
             print(f"[Service] 客户端异常: {e}")
         finally:
             conn.close()
-            print("[Service] 客户端断开")
 
     def stop(self):
         self.running = False
-        try:
-            self.lm.removeTestProvider(self.provider)
-        except Exception:
-            pass
+        self.write_state(status="stopped")
+        if IS_ANDROID:
+            try:
+                self.lm.removeTestProvider(self.provider)
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
-    port = 8888
-    try:
-        intent = PythonService.mService.getIntent()
-        p = intent.getIntExtra("port", 8888)
-        if p > 0:
-            port = p
-    except Exception:
-        pass
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--port", type=int, default=8888)
+    args = parser.parse_args()
+
+    port = args.port
+    if IS_ANDROID:
+        try:
+            intent = PythonService.mService.getIntent()
+            p = intent.getIntExtra("port", 8888)
+            if p > 0:
+                port = p
+        except Exception:
+            pass
 
     server = GpsServer(port=port)
-    try:
-        server.serve()
-    finally:
-        server.stop()
+    server.serve()

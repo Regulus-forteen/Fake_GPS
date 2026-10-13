@@ -4,13 +4,13 @@ package.name = gpsreceiver
 package.domain = com.example
 
 source.dir = .
-source.include_exts = py,png,jpg,kv,atlas
+source.include_exts = py,png,jpg,kv,atlas,ttf
 
 version = 0.1
 
-requirements = python3,kivy,pyjnius
+requirements = python3,kivy,pyjnius,kivy_garden.mapview
 
-android.permissions = ACCESS_FINE_LOCATION, ACCESS_COARSE_LOCATION, ACCESS_MOCK_LOCATION, FOREGROUND_SERVICE, FOREGROUND_SERVICE_LOCATION, POST_NOTIFICATIONS
+android.permissions = ACCESS_FINE_LOCATION, ACCESS_COARSE_LOCATION, ACCESS_MOCK_LOCATION, FOREGROUND_SERVICE, FOREGROUND_SERVICE_LOCATION, POST_NOTIFICATIONS, INTERNET
 
 services = Receiver:service/main.py:foreground
 

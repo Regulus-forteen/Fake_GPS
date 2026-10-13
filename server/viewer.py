@@ -1,10 +1,12 @@
 """
 Web 地图查看器 + 路线编辑器 + 历史记录
+新增：测试连接、定点模式、实际路径线
 零第三方依赖。
 """
 
 import json
 import os
+import socket as _socket
 import threading
 import time
 import urllib.request
@@ -17,6 +19,7 @@ HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 
 STATE = {
     "route": [],
+    "actual": [],
     "current": None,
     "status": "空闲",
     "running": False,
@@ -115,7 +118,7 @@ def history_delete(item_id):
 
 
 # ============================================================
-# IP 定位
+# 工具
 # ============================================================
 def get_ip_location():
     try:
@@ -139,6 +142,17 @@ def get_ip_location():
     return {"ok": False, "error": "IP 定位失败"}
 
 
+def test_connection(host, port):
+    try:
+        s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        s.settimeout(3)
+        s.connect((host, int(port)))
+        s.close()
+        return {"ok": True, "message": f"✅ 成功连接到 {host}:{port}"}
+    except Exception as e:
+        return {"ok": False, "message": f"❌ 连接失败: {e}"}
+
+
 HTML = r"""<!DOCTYPE html>
 <html>
 <head>
@@ -153,7 +167,7 @@ HTML = r"""<!DOCTYPE html>
     position: absolute; top: 10px; right: 10px; z-index: 1000;
     background: rgba(255,255,255,0.97); padding: 10px 12px;
     border-radius: 6px; font-family: sans-serif; font-size: 13px;
-    box-shadow: 0 1px 4px rgba(0,0,0,0.3); width: 260px;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.3); width: 270px;
     max-height: calc(100vh - 30px); overflow-y: auto;
   }
   #toolbar b.title { display: block; margin-bottom: 6px; font-size: 14px; }
@@ -229,6 +243,9 @@ HTML = r"""<!DOCTYPE html>
   .history-item .del { background: #fff0f0; border-color: #f0c0c0; color: #b00; }
   #history-empty { color: #999; font-size: 11px; text-align: center; padding: 8px; }
   #save-name { width: 100%; padding: 3px 5px; margin-top: 4px; }
+
+  .mode-row { background: #e3f2fd; padding: 4px 6px; border-radius: 4px; margin: 4px 0; }
+  .mode-row button { font-weight: bold; }
 </style>
 </head>
 <body>
@@ -236,6 +253,11 @@ HTML = r"""<!DOCTYPE html>
 
 <div id="toolbar">
   <b class="title">路线编辑器</b>
+
+  <div class="row mode-row">
+    <button id="appmode-route" class="active">路线</button>
+    <button id="appmode-home">定点</button>
+  </div>
 
   <div class="row">
     <button id="mode-click">打点</button>
@@ -265,6 +287,10 @@ HTML = r"""<!DOCTYPE html>
   <div id="net-fields">
     <div class="row">手机 IP: <input type="text" id="host" value="192.168.1.100"></div>
     <div class="row">端口: <input type="number" id="port" value="8888"></div>
+    <div class="row">
+      <button id="test-conn" style="width:100%;">🔌 测试连接</button>
+    </div>
+    <div class="row" id="test-result" style="font-size:11px;color:#666;"></div>
   </div>
 
   <div class="row">速度: <input type="number" id="speed" value="30"> km/h</div>
@@ -353,8 +379,11 @@ L.control.layers(
   { position: 'topleft' }
 ).addTo(map);
 
+// ============ 状态 ============
 let route = [];
-let mode = 'click';
+let mode = 'click';          // click | draw | view
+let appMode = 'route';       // route | home
+let homeCenter = null;
 let drawing = false;
 let lastDrawPoint = null;
 const DRAW_PIXEL_THRESHOLD = 6;
@@ -364,9 +393,9 @@ let routeMarkers = [];
 let currentMarker = null;
 let trailLine = null;
 let trailPoints = [];
+let actualLine = null;
+let actualPoints = [];
 let homeMarker = null;
-
-// 画笔模式专用：实时更新的 polyline，不重建 marker
 let livePolyline = null;
 
 // ============ 渲染路线 ============
@@ -374,9 +403,7 @@ function renderRoute() {
   routeMarkers.forEach(m => map.removeLayer(m));
   routeMarkers = [];
   if (routeLine) { map.removeLayer(routeLine); routeLine = null; }
-
   document.getElementById('count').textContent = route.length;
-
   if (route.length === 0) return;
 
   route.forEach(p => {
@@ -412,7 +439,10 @@ function updateCurrent(pt) {
 function clearTrail() {
   if (trailLine) { map.removeLayer(trailLine); trailLine = null; }
   trailPoints = [];
+  if (actualLine) { map.removeLayer(actualLine); actualLine = null; }
+  actualPoints = [];
 }
+
 function addTrailPoint(pt) {
   trailPoints.push([pt.lat, pt.lon]);
   if (!trailLine) {
@@ -424,7 +454,33 @@ function addTrailPoint(pt) {
   }
 }
 
-// ============ 模式切换 ============
+function updateActualLine(actual) {
+  if (!actual || !actual.length) return;
+  actualPoints = actual.map(p => [p.lat, p.lon]);
+  if (!actualLine) {
+    actualLine = L.polyline(actualPoints, {
+      color: '#ff6f00', weight: 3, opacity: 0.9
+    }).addTo(map);
+  } else {
+    actualLine.setLatLngs(actualPoints);
+  }
+}
+
+// ============ 应用模式切换 ============
+function setAppMode(m) {
+  appMode = m;
+  document.getElementById('appmode-route').classList.toggle('active', m === 'route');
+  document.getElementById('appmode-home').classList.toggle('active', m === 'home');
+  if (m === 'home') {
+    document.getElementById('mode-hint').textContent = '单击地图选定点中心';
+  } else {
+    document.getElementById('mode-hint').textContent = '单击地图加一个路径点';
+  }
+}
+document.getElementById('appmode-route').onclick = () => setAppMode('route');
+document.getElementById('appmode-home').onclick = () => setAppMode('home');
+
+// ============ 编辑模式 ============
 const HINTS = {
   click: '单击地图加一个路径点；拖动地图正常平移',
   draw: '按住鼠标拖动连续画点；地图已锁定',
@@ -440,7 +496,6 @@ function disableMapInteractions() {
   if (map.touchZoom) map.touchZoom.disable();
   if (map.tap) map.tap.disable();
 }
-
 function enableMapInteractions() {
   map.dragging.enable();
   map.doubleClickZoom.enable();
@@ -452,30 +507,23 @@ function enableMapInteractions() {
 }
 
 function setMode(m) {
-  // 切模式时清掉半截画笔
   if (drawing) {
     drawing = false;
     lastDrawPoint = null;
-    if (livePolyline) {
-      map.removeLayer(livePolyline);
-      livePolyline = null;
-    }
+    if (livePolyline) { map.removeLayer(livePolyline); livePolyline = null; }
     renderRoute();
   }
-
   mode = m;
   document.getElementById('mode-click').classList.toggle('active', m === 'click');
   document.getElementById('mode-draw').classList.toggle('active', m === 'draw');
   document.getElementById('mode-view').classList.toggle('active', m === 'view');
   document.getElementById('mode-hint').textContent = HINTS[m] || '';
-
   if (m === 'draw') {
     disableMapInteractions();
     map.getContainer().style.cursor = 'crosshair';
   } else {
     enableMapInteractions();
-    map.getContainer().style.cursor =
-      m === 'click' ? 'crosshair' : 'grab';
+    map.getContainer().style.cursor = m === 'click' ? 'crosshair' : 'grab';
   }
 }
 document.getElementById('mode-click').onclick = () => setMode('click');
@@ -491,28 +539,33 @@ function syncSimMode() {
 simCheckbox.onchange = syncSimMode;
 syncSimMode();
 
-// ============ 打点模式：单击加点 ============
+// ============ 地图交互 ============
 map.on('click', (e) => {
+  // 定点模式：单击设定中心
+  if (appMode === 'home') {
+    homeCenter = {lat: e.latlng.lat, lon: e.latlng.lng};
+    if (homeMarker) map.removeLayer(homeMarker);
+    homeMarker = L.circleMarker([homeCenter.lat, homeCenter.lon], {
+      radius: 12, color: '#4caf50', fillColor: '#4caf50',
+      fillOpacity: 0.5, weight: 3
+    }).addTo(map).bindPopup('定点中心');
+    return;
+  }
   if (mode !== 'click') return;
   route.push({ lat: e.latlng.lat, lon: e.latlng.lng });
   renderRoute();
 });
 
-// ============ 画笔模式：实时 polyline ============
 map.on('mousedown', (e) => {
-  if (mode !== 'draw') return;
+  if (mode !== 'draw' || appMode !== 'route') return;
   L.DomEvent.preventDefault(e);
   drawing = true;
   lastDrawPoint = e.containerPoint;
-
-  // 从当前 route 末尾开始一条新的实时线
   const firstPoint = [e.latlng.lat, e.latlng.lng];
   livePolyline = L.polyline([firstPoint], {
     color: '#1976d2', weight: 3, opacity: 0.85
   }).addTo(map);
-
   route.push({ lat: e.latlng.lat, lon: e.latlng.lng });
-  // 只更新计数，不重建所有覆盖物
   document.getElementById('count').textContent = route.length;
 });
 
@@ -523,11 +576,8 @@ map.on('mousemove', (e) => {
   const dy = e.containerPoint.y - lastDrawPoint.y;
   if (Math.sqrt(dx * dx + dy * dy) < DRAW_PIXEL_THRESHOLD) return;
   lastDrawPoint = e.containerPoint;
-
   route.push({ lat: e.latlng.lat, lon: e.latlng.lng });
-  if (livePolyline) {
-    livePolyline.addLatLng([e.latlng.lat, e.latlng.lng]);
-  }
+  if (livePolyline) livePolyline.addLatLng([e.latlng.lat, e.latlng.lng]);
   document.getElementById('count').textContent = route.length;
 });
 
@@ -535,11 +585,7 @@ map.on('mouseup', () => {
   if (!drawing) return;
   drawing = false;
   lastDrawPoint = null;
-  if (livePolyline) {
-    map.removeLayer(livePolyline);
-    livePolyline = null;
-  }
-  // 画完一段才重建一次
+  if (livePolyline) { map.removeLayer(livePolyline); livePolyline = null; }
   renderRoute();
 });
 
@@ -547,10 +593,7 @@ map.on('mouseout', () => {
   if (!drawing) return;
   drawing = false;
   lastDrawPoint = null;
-  if (livePolyline) {
-    map.removeLayer(livePolyline);
-    livePolyline = null;
-  }
+  if (livePolyline) { map.removeLayer(livePolyline); livePolyline = null; }
   renderRoute();
 });
 
@@ -559,6 +602,8 @@ document.getElementById('undo').onclick = () => { route.pop(); renderRoute(); };
 document.getElementById('clear').onclick = () => {
   route = [];
   if (currentMarker) { map.removeLayer(currentMarker); currentMarker = null; }
+  if (homeMarker) { map.removeLayer(homeMarker); homeMarker = null; }
+  homeCenter = null;
   clearTrail();
   renderRoute();
 };
@@ -580,10 +625,7 @@ function showHome(lat, lon, info) {
 }
 function browserLocate() {
   return new Promise((resolve, reject) => {
-    if (!navigator.geolocation) {
-      reject(new Error('浏览器不支持 Geolocation'));
-      return;
-    }
+    if (!navigator.geolocation) { reject(new Error('不支持')); return; }
     navigator.geolocation.getCurrentPosition(
       (pos) => resolve({
         lat: pos.coords.latitude,
@@ -629,6 +671,28 @@ async function locateMe() {
   btn.disabled = false;
 }
 document.getElementById('locate').onclick = locateMe;
+
+// ============ 测试连接 ============
+document.getElementById('test-conn').onclick = async () => {
+  const host = document.getElementById('host').value.trim();
+  const port = parseInt(document.getElementById('port').value);
+  const resultEl = document.getElementById('test-result');
+  resultEl.textContent = '测试中...';
+  resultEl.style.color = '#666';
+  try {
+    const r = await fetch('/api/test-connection', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({host, port})
+    });
+    const d = await r.json();
+    resultEl.textContent = d.message;
+    resultEl.style.color = d.ok ? '#2e7d32' : '#c62828';
+  } catch (e) {
+    resultEl.textContent = '请求失败: ' + e;
+    resultEl.style.color = '#c62828';
+  }
+};
 
 // ============ 高级参数 ============
 const PRESETS = {
@@ -694,7 +758,6 @@ function fmtTime(ts) {
   return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ` +
          `${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
-
 async function refreshHistory() {
   const container = document.getElementById('history-list');
   try {
@@ -724,7 +787,6 @@ async function refreshHistory() {
     container.innerHTML = '<div id="history-empty">加载失败</div>';
   }
 }
-
 function loadHistory(item) {
   route = item.route.map(p => ({lat: p.lat, lon: p.lon}));
   if (item.params) {
@@ -739,22 +801,15 @@ function loadHistory(item) {
     applyAdvanced(item.params);
   }
   renderRoute();
-  if (routeLine) {
-    map.fitBounds(routeLine.getBounds(), { padding: [40, 40] });
-  }
+  if (routeLine) map.fitBounds(routeLine.getBounds(), { padding: [40, 40] });
 }
-
 async function delHistory(id) {
   if (!confirm('删除这条记录？')) return;
   await fetch('/api/history/' + id, { method: 'DELETE' });
   refreshHistory();
 }
-
 document.getElementById('save-history').onclick = async () => {
-  if (route.length < 2) {
-    alert('至少 2 个路径点才能保存');
-    return;
-  }
+  if (route.length < 2) { alert('至少 2 个路径点才能保存'); return; }
   const nameInput = document.getElementById('save-name');
   const name = nameInput.value.trim() || `路线_${fmtTime(Date.now()/1000)}`;
   const adv = readAdvanced();
@@ -780,21 +835,42 @@ document.getElementById('save-history').onclick = async () => {
 
 // ============ 开始 / 停止 ============
 document.getElementById('start').onclick = async () => {
-  if (route.length < 2) {
-    alert('请至少添加 2 个路径点');
+  const adv = readAdvanced();
+  const isSim = simCheckbox.checked;
+  const host = document.getElementById('host').value.trim();
+  const port = parseInt(document.getElementById('port').value);
+
+  clearTrail();
+  await fetch('/api/stop', { method: 'POST' });
+  await new Promise(r => setTimeout(r, 200));
+
+  if (appMode === 'home') {
+    if (!homeCenter) { alert('请先在地图上点选定点中心'); return; }
+    const cfg = {
+      mode: 'home',
+      home: homeCenter,
+      host: host, port: port,
+      dry_run: isSim,
+      ...adv,
+    };
+    await fetch('/api/start', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(cfg)
+    });
     return;
   }
-  const adv = readAdvanced();
+
+  if (route.length < 2) { alert('请至少添加 2 个路径点'); return; }
   const cfg = {
+    mode: 'route',
     route: route,
-    host: document.getElementById('host').value.trim(),
-    port: parseInt(document.getElementById('port').value),
+    host: host, port: port,
     speed: parseFloat(document.getElementById('speed').value),
     loop: document.getElementById('loop').checked,
-    dry_run: simCheckbox.checked,
+    dry_run: isSim,
     ...adv,
   };
-  clearTrail();
   await fetch('/api/route', {
     method: 'POST',
     headers: {'Content-Type':'application/json'},
@@ -821,6 +897,9 @@ async function poll() {
       updateCurrent(s.current);
       if (simCheckbox.checked) addTrailPoint(s.current);
     }
+    if (s.actual && s.actual.length > 0) {
+      updateActualLine(s.actual);
+    }
   } catch (e) {
     document.getElementById('status').textContent = '连接失败';
   }
@@ -829,6 +908,7 @@ setInterval(poll, 800);
 poll();
 
 setMode('click');
+setAppMode('route');
 refreshHistory();
 </script>
 </body>
@@ -881,6 +961,7 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == '/api/start':
             try:
                 cfg = json.loads(raw.decode('utf-8')) if raw else {}
+                update_state(actual=[])
                 _start_playback(cfg)
                 self._send_json({"ok": True})
             except Exception as e:
@@ -889,6 +970,14 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == '/api/stop':
             _stop_playback()
             self._send_json({"ok": True})
+
+        elif self.path == '/api/test-connection':
+            try:
+                cfg = json.loads(raw.decode('utf-8'))
+                result = test_connection(cfg['host'], int(cfg['port']))
+                self._send_json(result)
+            except Exception as e:
+                self._send_json({"ok": False, "message": str(e)}, 400)
 
         elif self.path == '/api/history':
             try:
