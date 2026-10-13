@@ -168,13 +168,14 @@ def get_local_ip():
 
 def get_state_file_path():
     if IS_ANDROID:
+        # 主进程用 mActivity.getFilesDir()，和 service 进程写的是同一个目录
         try:
-            from jnius import autoclass
-            PythonService = autoclass('org.kivy.android.PythonService')
-            files_dir = PythonService.mService.getFilesDir().getAbsolutePath()
+            from android import mActivity
+            files_dir = mActivity.getFilesDir().getAbsolutePath()
             return os.path.join(files_dir, 'state.json')
         except Exception as e:
-            print(f"[Path] {e}")
+            print(f"[Path] mActivity 失败: {e}")
+        return '/data/data/com.example.gpsreceiver/files/state.json'
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), 'state.json')
 
 
@@ -539,6 +540,7 @@ class ReceiverUI(FloatLayout):
         )
         self.add_widget(main)
 
+        # ---------- 标题 ----------
         title_row = BoxLayout(size_hint_y=None, height=dp(36), spacing=dp(6))
         title = Label(
             text="GPS 模拟位置", font_size=dp(18),
@@ -561,6 +563,7 @@ class ReceiverUI(FloatLayout):
         title_row.add_widget(self.status_badge)
         main.add_widget(title_row)
 
+        # ---------- 状态卡片 ----------
         card = Card(size_hint_y=None, height=dp(138),
                     orientation='vertical',
                     padding=[dp(14), dp(10), dp(14), dp(10)],
@@ -584,6 +587,7 @@ class ReceiverUI(FloatLayout):
 
         main.add_widget(card)
 
+        # ---------- 地图 ----------
         map_card = Card(
             orientation='vertical',
             padding=[dp(2), dp(2), dp(2), dp(2)],
@@ -606,6 +610,7 @@ class ReceiverUI(FloatLayout):
         map_card.add_widget(map_container)
         main.add_widget(map_card)
 
+        # ---------- 图层 ----------
         self._track_line = MapTrackLayer(self.mapview)
         self.mapview.add_widget(self._track_line)
         self._track_line.pos = (0, 0)
@@ -624,6 +629,7 @@ class ReceiverUI(FloatLayout):
 
         self._map_card = map_card
 
+        # ---------- 底部 ----------
         bottom_card = Card(
             orientation='vertical',
             size_hint_y=None, height=dp(104),
@@ -677,6 +683,7 @@ class ReceiverUI(FloatLayout):
 
         main.add_widget(bottom_card)
 
+        # ---------- 悬浮按钮 ----------
         btn_size = dp(46)
         self._btn_locate = CircleIconButton(
             icon_type="locate",
@@ -701,6 +708,7 @@ class ReceiverUI(FloatLayout):
         Clock.schedule_once(self._position_buttons, 0.3)
         Clock.schedule_once(self._position_buttons, 1.0)
 
+        # ---------- 状态 ----------
         self.service_running = False
         self.state_reader = StateReader()
         self.last_count = 0
@@ -786,9 +794,12 @@ class ReceiverUI(FloatLayout):
                 from android import mActivity
                 Intent = autoclass('android.content.Intent')
                 service = autoclass('com.example.gpsreceiver.ServiceReceiver')
-                mActivity.startService(
-                    Intent(mActivity, service).putExtra("port", port)
-                )
+                intent = Intent(mActivity, service)
+                # 关键：p4a 的 PythonService.onStartCommand 会做
+                # intent.getAction().equals(ACTION_START)，action 为 null 时 NPE
+                intent.setAction('org.kivy.android.PythonService.ACTION_START')
+                intent.putExtra("port", port)
+                mActivity.startService(intent)
                 return True
             except Exception as e:
                 print(f"[Service] 启动失败: {e}")
@@ -819,7 +830,9 @@ class ReceiverUI(FloatLayout):
                 from android import mActivity
                 Intent = autoclass('android.content.Intent')
                 service = autoclass('com.example.gpsreceiver.ServiceReceiver')
-                mActivity.stopService(Intent(mActivity, service))
+                intent = Intent(mActivity, service)
+                intent.setAction('org.kivy.android.PythonService.ACTION_START')
+                mActivity.stopService(intent)
             except Exception as e:
                 print(f"[Service] 停止失败: {e}")
         else:
