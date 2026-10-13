@@ -1,9 +1,9 @@
 # ========== 必须在所有 Kivy import 之前 ==========
 from kivy.config import Config
-Config.set('graphics', 'orientation', 'portrait')
 Config.set('graphics', 'width', '420')
 Config.set('graphics', 'height', '820')
 Config.set('graphics', 'resizable', True)
+# ================================================
 
 import os
 try:
@@ -12,9 +12,9 @@ try:
     os.environ.setdefault('REQUESTS_CA_BUNDLE', certifi.where())
 except ImportError:
     pass
-# ================================================
 
 from kivy.app import App
+from kivy.core.window import Window
 from kivy.core.text import LabelBase
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.label import Label
@@ -32,6 +32,25 @@ import json
 import math
 import subprocess
 import signal
+
+# 强制竖屏（Android 需要这个，Config.set 不生效）
+Window.softinput_mode = 'below_target'
+try:
+    Window.orientation = 'portrait'
+except Exception:
+    pass
+# 用 android 的 API 强制设置
+try:
+    from android import mActivity
+    from jnius import autoclass
+    ActivityInfo = autoclass('android.content.pm.ActivityInfo')
+    mActivity.setRequestedOrientation(
+        ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+    )
+    print("[Orientation] 已设置为竖屏")
+except Exception as e:
+    print(f"[Orientation] 桌面模式: {e}")
+
 
 IS_ANDROID = ('ANDROID_ARGUMENT' in os.environ or
               'ANDROID_PRIVATE' in os.environ)
@@ -330,16 +349,13 @@ class CircleIconButton(Button):
 # 当前位置圆点图层（蓝心白边）
 # ============================================================
 class MapDotLayer(MapLayer):
-    """在地图上画一个蓝心白边的圆点，作为当前位置标志"""
-
     def __init__(self, mapview, lat=0, lon=0, **kwargs):
         super().__init__(**kwargs)
         self.mapview = mapview
         self.lat = lat
         self.lon = lon
-        # 点尺寸
-        self._radius = dp(6)          # 主色半径
-        self._outline = dp(2)         # 白色描边宽度
+        self._radius = dp(6)
+        self._outline = dp(2)
 
         self.mapview.bind(center=self.reposition,
                           zoom=self.reposition,
@@ -363,11 +379,9 @@ class MapDotLayer(MapLayer):
         total_r = self._radius + self._outline
 
         with self.canvas:
-            # 白色外圈
             Color(1, 1, 1, 1)
             Ellipse(pos=(x - total_r, y - total_r),
                     size=(total_r * 2, total_r * 2))
-            # 蓝色内芯
             Color(0.29, 0.62, 1.0, 1)
             Ellipse(pos=(x - self._radius, y - self._radius),
                     size=(self._radius * 2, self._radius * 2))
@@ -599,8 +613,7 @@ class ReceiverUI(FloatLayout):
         map_card.add_widget(map_container)
         main.add_widget(map_card)
 
-        # ---------- 图层：轨迹 + 当前点 ----------
-        # 轨迹图层（在下面，先加）
+        # ---------- 图层 ----------
         self._track_line = MapTrackLayer(self.mapview)
         self.mapview.add_widget(self._track_line)
         self._track_line.pos = (0, 0)
@@ -609,7 +622,6 @@ class ReceiverUI(FloatLayout):
             size=lambda inst, val: setattr(self._track_line, 'size', val)
         )
 
-        # 当前点图层（在上面，后加）
         self._dot_layer = MapDotLayer(self.mapview, lat=init_lat, lon=init_lon)
         self.mapview.add_widget(self._dot_layer)
         self._dot_layer.pos = (0, 0)
@@ -697,6 +709,7 @@ class ReceiverUI(FloatLayout):
                       size=self._position_buttons)
         Clock.schedule_once(self._position_buttons, 0)
         Clock.schedule_once(self._position_buttons, 0.3)
+        Clock.schedule_once(self._position_buttons, 1.0)
 
         # ---------- 状态 ----------
         self.service_running = False
@@ -868,9 +881,7 @@ class ReceiverUI(FloatLayout):
         self.current_lon = lon
         self.mapview.center_on(lat, lon)
 
-        # 更新轨迹
         self._track_line.add_point(lat, lon)
-        # 更新当前位置蓝点
         self._dot_layer.set_position(lat, lon)
 
     def clear_track(self):
