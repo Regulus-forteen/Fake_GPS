@@ -10,30 +10,69 @@ import threading
 import time
 import json
 import argparse
+import traceback
+
+LOG_FILE = None
+
+
+def _get_state_dir():
+    if IS_ANDROID:
+        try:
+            from jnius import autoclass
+            PythonService = autoclass('org.kivy.android.PythonService')
+            if PythonService.mService is not None:
+                return PythonService.mService.getFilesDir().getAbsolutePath()
+        except Exception:
+            pass
+        return '/data/data/com.example.gpsreceiver/files'
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _init_log():
+    global LOG_FILE
+    try:
+        LOG_FILE = os.path.join(_get_state_dir(), 'service.log')
+        with open(LOG_FILE, 'w') as f:
+            f.write("")
+    except Exception:
+        LOG_FILE = None
+
+
+def _log(msg):
+    print(msg)
+    if LOG_FILE:
+        try:
+            with open(LOG_FILE, 'a') as f:
+                f.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
+        except Exception:
+            pass
+
 
 IS_ANDROID = ('ANDROID_ARGUMENT' in os.environ or
               'ANDROID_PRIVATE' in os.environ)
 
+jnius = None
 if IS_ANDROID:
-    from jnius import autoclass
-    Context = autoclass('android.content.Context')
-    LocationManager = autoclass('android.location.LocationManager')
-    Location = autoclass('android.location.Location')
-    SystemClock = autoclass('android.os.SystemClock')
-    NotificationBuilder = autoclass('android.app.Notification$Builder')
-    NotificationChannel = autoclass('android.app.NotificationChannel')
-    NotificationManager = autoclass('android.app.NotificationManager')
-    Build = autoclass('android.os.Build')
-    PythonService = autoclass('org.kivy.android.PythonService')
+    try:
+        from jnius import autoclass
+        jnius = autoclass
+    except Exception as e:
+        print(f"[Service] jnius 导入失败: {e}")
+        jnius = None
 
 
 def get_state_file_path():
     if IS_ANDROID:
         try:
-            files_dir = PythonService.mService.getFilesDir().getAbsolutePath()
-            return os.path.join(files_dir, 'state.json')
-        except Exception as e:
-            print(f"[Path] {e}")
+            if jnius is not None:
+                PythonService = jnius('org.kivy.android.PythonService')
+                if PythonService.mService is not None:
+                    p = (PythonService.mService.getFilesDir()
+                         .getAbsolutePath() + '/state.json')
+                    return p
+        except Exception:
+            pass
+        return '/data/data/com.example.gpsreceiver/files/state.json'
     return os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         'state.json'
@@ -49,10 +88,21 @@ class GpsServer:
         self.state_file = get_state_file_path()
         self.foreground_ok = False
 
-        if IS_ANDROID:
-            self.service = PythonService.mService
-            self.lm = self.service.getSystemService(Context.LOCATION_SERVICE)
-            self.provider = "gps"
+        if IS_ANDROID and jnius is not None:
+            try:
+                PythonService = jnius('org.kivy.android.PythonService')
+                Context = jnius('android.content.Context')
+                self.service = PythonService.mService
+                self.lm = self.service.getSystemService(
+                    Context.LOCATION_SERVICE
+                )
+                self.provider = "gps"
+                _log("[Service] Android 服务初始化成功")
+            except Exception as e:
+                _log(f"[Service] Android 初始化失败: {e}")
+                _log(traceback.format_exc())
+                self.service = None
+                self.lm = None
 
     def write_state(self, lat=None, lon=None, status="running", extra=None):
         try:
@@ -73,15 +123,21 @@ class GpsServer:
                 json.dump(data, f)
             os.replace(tmp, self.state_file)
         except Exception as e:
-            print(f"[Service] 写状态失败: {e}")
+            _log(f"[Service] 写状态失败: {e}")
 
     def start_foreground(self):
-        if not IS_ANDROID:
+        if not IS_ANDROID or jnius is None:
             print("[Service] 桌面模式，跳过前台服务")
             self.foreground_ok = True
             return
 
         try:
+            NotificationBuilder = jnius('android.app.Notification$Builder')
+            NotificationChannel = jnius('android.app.NotificationChannel')
+            NotificationManager = jnius('android.app.NotificationManager')
+            Build = jnius('android.os.Build')
+            Context = jnius('android.content.Context')
+
             if Build.VERSION.SDK_INT >= 26:
                 channel = NotificationChannel(
                     "gps_receiver", "GPS 接收器",
@@ -90,7 +146,7 @@ class GpsServer:
                 nm = self.service.getSystemService(Context.NOTIFICATION_SERVICE)
                 nm.createNotificationChannel(channel)
 
-            Icon = autoclass('android.R$drawable')
+            Icon = jnius('android.R$drawable')
             builder = NotificationBuilder(self.service, "gps_receiver")
             builder.setContentTitle("GPS 接收器运行中")
             builder.setContentText(f"监听端口 {self.port}")
@@ -102,24 +158,25 @@ class GpsServer:
                 try:
                     self.service.startForeground(1001, notif, 8)
                     self.foreground_ok = True
-                    print("[Service] startForeground(3args) OK")
+                    _log("[Service] startForeground(3args) OK")
                 except Exception as e:
-                    print(f"[Service] startForeground(3args) 失败: {e}")
+                    _log(f"[Service] 3args 失败: {e}")
                     try:
                         self.service.startForeground(1001, notif)
                         self.foreground_ok = True
-                        print("[Service] startForeground(2args) OK")
+                        _log("[Service] startForeground(2args) OK")
                     except Exception as e2:
-                        print(f"[Service] startForeground(2args) 也失败: {e2}")
+                        _log(f"[Service] 2args 也失败: {e2}")
             else:
                 self.service.startForeground(1001, notif)
                 self.foreground_ok = True
-                print("[Service] startForeground OK")
+                _log("[Service] startForeground OK")
         except Exception as e:
-            print(f"[Service] start_foreground 整体失败: {e}")
+            _log(f"[Service] start_foreground 整体失败: {e}")
+            _log(traceback.format_exc())
 
     def setup_provider(self):
-        if not IS_ANDROID:
+        if not IS_ANDROID or jnius is None:
             self.provider_ready = True
             self.write_state(status="ready")
             return
@@ -131,19 +188,22 @@ class GpsServer:
             )
             self.lm.setTestProviderEnabled(self.provider, True)
             self.provider_ready = True
-            print("[Service] Provider 注册成功")
+            _log("[Service] Provider 注册成功")
             self.write_state(status="provider_ready")
         except Exception as e:
-            print(f"[Service] addTestProvider 失败: {e}")
+            _log(f"[Service] addTestProvider 失败: {e}")
             self.provider_ready = False
-            self.write_state(status="provider_error", extra={"error": str(e)})
+            self.write_state(status="provider_error",
+                             extra={"error": str(e)})
 
     def inject(self, lat, lon):
         if not self.provider_ready:
             return
         self.count += 1
-        if IS_ANDROID:
+        if IS_ANDROID and jnius is not None:
             try:
+                Location = jnius('android.location.Location')
+                SystemClock = jnius('android.os.SystemClock')
                 loc = Location(self.provider)
                 loc.setLatitude(lat)
                 loc.setLongitude(lon)
@@ -153,7 +213,7 @@ class GpsServer:
                 loc.setElapsedRealtimeNanos(SystemClock.elapsedRealtimeNanos())
                 self.lm.setTestProviderLocation(self.provider, loc)
             except Exception as e:
-                print(f"[Service] 注入失败: {e}")
+                _log(f"[Service] 注入失败: {e}")
         else:
             if self.count % 10 == 1:
                 print(f"[Service] #{self.count}: {lat:.6f}, {lon:.6f}")
@@ -169,11 +229,11 @@ class GpsServer:
             server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             server.bind(("0.0.0.0", self.port))
             server.listen(5)
-            print(f"[Service] 监听 0.0.0.0:{self.port}")
-            print(f"[Service] state: {self.state_file}")
+            _log(f"[Service] 监听 0.0.0.0:{self.port}")
+            _log(f"[Service] state: {self.state_file}")
             self.write_state(status="listening")
         except Exception as e:
-            print(f"[Service] bind 失败: {e}")
+            _log(f"[Service] bind 失败: {e}")
             self.write_state(status="bind_error", extra={"error": str(e)})
             return
 
@@ -183,11 +243,11 @@ class GpsServer:
                     conn, addr = server.accept()
                 except KeyboardInterrupt:
                     break
-                print(f"[Service] 客户端连接: {addr}")
+                _log(f"[Service] 客户端连接: {addr}")
                 threading.Thread(target=self.handle_client,
                                  args=(conn,), daemon=True).start()
         except KeyboardInterrupt:
-            print("\n[Service] Ctrl+C")
+            _log("\n[Service] Ctrl+C")
         finally:
             server.close()
             self.stop()
@@ -209,16 +269,16 @@ class GpsServer:
                         lat_str, lon_str = line.split(",")
                         self.inject(float(lat_str), float(lon_str))
                     except ValueError:
-                        print(f"[Service] 格式错误: {line}")
+                        _log(f"[Service] 格式错误: {line}")
         except Exception as e:
-            print(f"[Service] 客户端异常: {e}")
+            _log(f"[Service] 客户端异常: {e}")
         finally:
             conn.close()
 
     def stop(self):
         self.running = False
         self.write_state(status="stopped")
-        if IS_ANDROID:
+        if IS_ANDROID and jnius is not None:
             try:
                 self.lm.removeTestProvider(self.provider)
             except Exception:
@@ -226,19 +286,30 @@ class GpsServer:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--port", type=int, default=8888)
-    args = parser.parse_args()
+    _init_log()
+    _log("=" * 40)
+    _log(f"[Service] 启动, IS_ANDROID={IS_ANDROID}")
 
-    port = args.port
+    port = 8888
     if IS_ANDROID:
-        try:
-            intent = PythonService.mService.getIntent()
-            p = intent.getIntExtra("port", 8888)
-            if p > 0:
-                port = p
-        except Exception:
-            pass
+        arg = os.environ.get('PYTHON_SERVICE_ARGUMENT', '')
+        _log(f"[Service] PYTHON_SERVICE_ARGUMENT={arg!r}")
+        if arg:
+            try:
+                port = int(arg)
+            except ValueError:
+                _log(f"[Service] 参数不是数字: {arg!r}，用默认 {port}")
+    else:
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--port", type=int, default=8888)
+        args = parser.parse_args()
+        port = args.port
 
-    server = GpsServer(port=port)
-    server.serve()
+    _log(f"[Service] 最终端口: {port}")
+
+    try:
+        server = GpsServer(port=port)
+        server.serve()
+    except Exception as e:
+        _log(f"[Service] 顶层崩溃: {e}")
+        _log(traceback.format_exc())

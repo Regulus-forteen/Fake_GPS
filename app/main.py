@@ -60,6 +60,71 @@ if IS_ANDROID:
 
 
 # ============================================================
+# 定位权限 + 真实位置
+# ============================================================
+def request_location_permissions(callback=None):
+    """请求运行时定位权限。callback(granted: bool)"""
+    if not IS_ANDROID:
+        if callback:
+            callback(True)
+        return
+    try:
+        from android.permissions import (
+            request_permissions, Permission, check_permission
+        )
+        if check_permission(Permission.ACCESS_FINE_LOCATION):
+            print("[Perm] 已有定位权限")
+            if callback:
+                callback(True)
+            return
+
+        def _cb(perms, grants):
+            ok = bool(grants) and all(grants)
+            print(f"[Perm] 请求结果: {ok} (grants={grants})")
+            if callback:
+                callback(ok)
+
+        request_permissions(
+            [Permission.ACCESS_FINE_LOCATION,
+             Permission.ACCESS_COARSE_LOCATION],
+            _cb
+        )
+    except Exception as e:
+        print(f"[Perm] 请求失败: {e}")
+        if callback:
+            callback(False)
+
+
+def get_real_location():
+    """获取真实 GPS 位置。返回 (lat, lon) WGS-84，或 None"""
+    if not IS_ANDROID:
+        return None
+    try:
+        from jnius import autoclass
+        PythonActivity = autoclass('org.kivy.android.PythonActivity')
+        Context = autoclass('android.content.Context')
+        activity = PythonActivity.mActivity
+        lm = activity.getSystemService(Context.LOCATION_SERVICE)
+
+        best = None
+        # 从三种 provider 里挑时间最新的
+        for name in ['gps', 'network', 'passive']:
+            try:
+                loc = lm.getLastKnownLocation(name)
+                if loc is not None:
+                    if best is None or loc.getTime() > best.getTime():
+                        best = loc
+            except Exception:
+                pass
+
+        if best is not None:
+            return best.getLatitude(), best.getLongitude()
+    except Exception as e:
+        print(f"[RealLoc] {e}")
+    return None
+
+
+# ============================================================
 # 配色
 # ============================================================
 COLOR_BG = (0.10, 0.11, 0.14, 1)
@@ -168,7 +233,6 @@ def get_local_ip():
 
 def get_state_file_path():
     if IS_ANDROID:
-        # 主进程用 mActivity.getFilesDir()，和 service 进程写的是同一个目录
         try:
             from android import mActivity
             files_dir = mActivity.getFilesDir().getAbsolutePath()
@@ -735,6 +799,7 @@ class ReceiverUI(FloatLayout):
         self._btn_locate.pos = (x, y_locate)
 
     def _initial_center(self, dt):
+        # 优先用 state.json 里的历史位置
         state = self.state_reader.read()
         if state and state.get('lat') is not None:
             lat, lon = wgs84_to_gcj02(state['lat'], state['lon'])
@@ -742,9 +807,45 @@ class ReceiverUI(FloatLayout):
             self.current_lon = lon
             self.mapview.center_on(lat, lon)
             self._dot_layer.set_position(lat, lon)
+            # 顺便请求权限，供后续使用
+            request_location_permissions()
+            return
+        # 无历史位置 → 请求权限 + 拿真实 GPS
+        request_location_permissions(callback=self._on_perm_result)
+
+    def _on_perm_result(self, granted):
+        if not granted:
+            print("[RealLoc] 权限被拒绝，跳过")
+            return
+        real = get_real_location()
+        if real is None:
+            print("[RealLoc] 未拿到位置")
+            return
+        lat, lon = wgs84_to_gcj02(real[0], real[1])
+        print(f"[RealLoc] 真实位置: {real[0]:.6f}, {real[1]:.6f}")
+        if not self.track_points:
+            self.current_lat = lat
+            self.current_lon = lon
+            self.mapview.center_on(lat, lon)
+            self._dot_layer.set_position(lat, lon)
 
     def locate_current(self, *args):
-        self.mapview.center_on(self.current_lat, self.current_lon)
+        # 有模拟位置 → 跳到最后一个模拟点
+        if self.track_points:
+            lat, lon = self.track_points[-1]
+            self.mapview.center_on(lat, lon)
+            return
+        # 无模拟位置 → 重新获取真实位置
+        real = get_real_location()
+        if real is not None:
+            lat, lon = wgs84_to_gcj02(real[0], real[1])
+            self.current_lat = lat
+            self.current_lon = lon
+            self.mapview.center_on(lat, lon)
+            self._dot_layer.set_position(lat, lon)
+            print(f"[RealLoc] 定位到真实位置: {real[0]:.6f}, {real[1]:.6f}")
+        else:
+            print("[RealLoc] 拿不到真实位置")
 
     def toggle_layer(self, *args):
         if self._current_layer == 'vector':
@@ -791,15 +892,10 @@ class ReceiverUI(FloatLayout):
         if IS_ANDROID:
             try:
                 from jnius import autoclass
-                from android import mActivity
-                Intent = autoclass('android.content.Intent')
                 service = autoclass('com.example.gpsreceiver.ServiceReceiver')
-                intent = Intent(mActivity, service)
-                # 关键：p4a 的 PythonService.onStartCommand 会做
-                # intent.getAction().equals(ACTION_START)，action 为 null 时 NPE
-                intent.setAction('org.kivy.android.PythonService.ACTION_START')
-                intent.putExtra("port", port)
-                mActivity.startService(intent)
+                PythonActivity = autoclass('org.kivy.android.PythonActivity')
+                service.start(PythonActivity.mActivity, str(port))
+                print(f"[Service] service.start() 调用成功, port={port}")
                 return True
             except Exception as e:
                 print(f"[Service] 启动失败: {e}")
@@ -827,12 +923,10 @@ class ReceiverUI(FloatLayout):
         if IS_ANDROID:
             try:
                 from jnius import autoclass
-                from android import mActivity
-                Intent = autoclass('android.content.Intent')
                 service = autoclass('com.example.gpsreceiver.ServiceReceiver')
-                intent = Intent(mActivity, service)
-                intent.setAction('org.kivy.android.PythonService.ACTION_START')
-                mActivity.stopService(intent)
+                PythonActivity = autoclass('org.kivy.android.PythonActivity')
+                service.stop(PythonActivity.mActivity)
+                print("[Service] service.stop() 调用成功")
             except Exception as e:
                 print(f"[Service] 停止失败: {e}")
         else:

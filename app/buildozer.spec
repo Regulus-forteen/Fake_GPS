@@ -12,7 +12,7 @@ requirements = python3,kivy,pyjnius,kivy_garden.mapview
 
 android.permissions = ACCESS_FINE_LOCATION, ACCESS_COARSE_LOCATION, ACCESS_MOCK_LOCATION, FOREGROUND_SERVICE, FOREGROUND_SERVICE_LOCATION, POST_NOTIFICATIONS, INTERNET
 
-services = Receiver:service/main.py:foreground
+services = Receiver:service/main.py:foreground:foregroundServiceType=location
 
 # p4a.hook = for-build/p4a/hook.py
 
