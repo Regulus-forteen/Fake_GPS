@@ -1,6 +1,6 @@
 """
 前台服务（跨平台）
-- Android: 监听 TCP + 注入 GPS + 写 state.json
+- Android: 监听 TCP + 注入 GPS/Network/Fused + 写 state.json
 - 桌面: 监听 TCP + 只写 state.json
 """
 import os
@@ -88,6 +88,8 @@ class GpsServer:
         self.state_file = get_state_file_path()
         self.foreground_ok = False
         self._last_status = "starting"
+        # 三源：gps（GPS 芯片）、network（WiFi/基站）、fused（融合定位）
+        self.providers = ['gps', 'network', 'fused']
 
         if IS_ANDROID and jnius is not None:
             try:
@@ -97,7 +99,7 @@ class GpsServer:
                 self.lm = self.service.getSystemService(
                     Context.LOCATION_SERVICE
                 )
-                self.provider = "gps"
+                self.provider = "gps"   # 兼容旧代码
                 _log("[Service] Android 服务初始化成功")
             except Exception as e:
                 _log(f"[Service] Android 初始化失败: {e}")
@@ -136,7 +138,6 @@ class GpsServer:
             NotificationBuilder = jnius('android.app.Notification$Builder')
             NotificationChannel = jnius('android.app.NotificationChannel')
             NotificationManager = jnius('android.app.NotificationManager')
-            # 关键：嵌套类必须写 Build$VERSION
             BuildVERSION = jnius('android.os.Build$VERSION')
             Context = jnius('android.content.Context')
 
@@ -199,31 +200,32 @@ class GpsServer:
             self._last_status = "ready"
             self.write_state(status="ready")
             return
-        try:
-            # 参数：
-            # name, requiresNetwork, requiresSatellite, requiresCell,
-            # hasMonetaryCost, supportsAltitude, supportsSpeed,
-            # supportsBearing, powerRequirement, accuracy
-            # powerRequirement: 1=POWER_LOW, 2=POWER_MEDIUM, 3=POWER_HIGH
-            # accuracy: 1=ACCURACY_FINE, 2=ACCURACY_COARSE
-            self.lm.addTestProvider(
-                self.provider,
-                False, False, False, False,
-                True, True, True,
-                1,    # POWER_LOW
-                1     # ACCURACY_FINE
-            )
-            self.lm.setTestProviderEnabled(self.provider, True)
+
+        ok_count = 0
+        for name in self.providers:
+            try:
+                self.lm.addTestProvider(
+                    name,
+                    False, False, False, False,
+                    True, True, True,
+                    1,   # powerRequirement = POWER_LOW
+                    1    # accuracy = ACCURACY_FINE
+                )
+                self.lm.setTestProviderEnabled(name, True)
+                _log(f"[Service] {name} provider 注册成功")
+                ok_count += 1
+            except Exception as e:
+                _log(f"[Service] {name} provider 注册失败: {e}")
+
+        if ok_count > 0:
             self.provider_ready = True
             self._last_status = "provider_ready"
-            _log("[Service] Provider 注册成功")
             self.write_state(status="provider_ready")
-        except Exception as e:
-            _log(f"[Service] addTestProvider 失败: {e}")
+        else:
             self.provider_ready = False
             self._last_status = "provider_error"
             self.write_state(status="provider_error",
-                             extra={"error": str(e)})
+                             extra={"error": "all providers failed"})
 
     def inject(self, lat, lon):
         if not self.provider_ready:
@@ -233,16 +235,29 @@ class GpsServer:
             try:
                 Location = jnius('android.location.Location')
                 SystemClock = jnius('android.os.SystemClock')
-                loc = Location(self.provider)
-                loc.setLatitude(lat)
-                loc.setLongitude(lon)
-                loc.setAccuracy(3.0)
-                loc.setAltitude(50.0)
-                loc.setTime(System.currentTimeMillis())
-                loc.setElapsedRealtimeNanos(SystemClock.elapsedRealtimeNanos())
-                self.lm.setTestProviderLocation(self.provider, loc)
+                elapsed = SystemClock.elapsedRealtimeNanos()
+                now_ms = System.currentTimeMillis()
+
+                # 三源同时注入
+                for name in self.providers:
+                    try:
+                        loc = Location(name)
+                        loc.setLatitude(lat)
+                        loc.setLongitude(lon)
+                        if name == 'gps':
+                            loc.setAccuracy(3.0)
+                        elif name == 'network':
+                            loc.setAccuracy(50.0)
+                        else:
+                            loc.setAccuracy(10.0)
+                        loc.setAltitude(50.0)
+                        loc.setTime(now_ms)
+                        loc.setElapsedRealtimeNanos(elapsed)
+                        self.lm.setTestProviderLocation(name, loc)
+                    except Exception as e:
+                        _log(f"[Service] {name} 注入失败: {e}")
             except Exception as e:
-                _log(f"[Service] 注入失败: {e}")
+                _log(f"[Service] 注入异常: {e}")
         else:
             if self.count % 10 == 1:
                 print(f"[Service] #{self.count}: {lat:.6f}, {lon:.6f}")
@@ -252,7 +267,6 @@ class GpsServer:
     def serve(self):
         self.write_state(status="starting")
 
-        # 先监听端口
         try:
             server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -275,19 +289,16 @@ class GpsServer:
             self.write_state(status="bind_error", extra={"error": str(e)})
             return
 
-        # 再前台服务
         try:
             self.start_foreground()
         except Exception as e:
             _log(f"[Service] start_foreground 外层异常: {e}")
 
-        # 再注册 provider
         try:
             self.setup_provider()
         except Exception as e:
             _log(f"[Service] setup_provider 外层异常: {e}")
 
-        # 处理连接
         try:
             while self.running:
                 try:
@@ -330,10 +341,11 @@ class GpsServer:
         self.running = False
         self.write_state(status="stopped")
         if IS_ANDROID and jnius is not None:
-            try:
-                self.lm.removeTestProvider(self.provider)
-            except Exception:
-                pass
+            for name in getattr(self, 'providers', ['gps']):
+                try:
+                    self.lm.removeTestProvider(name)
+                except Exception:
+                    pass
 
 
 if __name__ == "__main__":
