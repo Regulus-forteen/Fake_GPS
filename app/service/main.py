@@ -1,7 +1,13 @@
 """
 前台服务（跨平台）
-- Android: 监听 TCP + 注入 GPS/Network/Fused + 写 state.json
+- Android: 监听 TCP + 注入 GPS/Network + 每100ms高频写 + 写 state.json
 - 桌面: 监听 TCP + 只写 state.json
+
+完全对齐影梭（GoGoGo）的实现：
+- 只注册 GPS + NETWORK，不注册 FUSED
+- GPS / NETWORK 分别用不同参数
+- Location 带 satellites / bearing / speed
+- 独立线程每 100ms 无条件写一遍
 """
 import os
 import sys
@@ -79,6 +85,19 @@ def get_state_file_path():
     )
 
 
+# Java 常量
+GPS_PROVIDER = "gps"
+NETWORK_PROVIDER = "network"
+
+# ProviderProperties（Android 12+，SDK_INT >= 31）
+# 值参考 android.location.provider.ProviderProperties
+POWER_USAGE_LOW = 1
+POWER_USAGE_MEDIUM = 2
+POWER_USAGE_HIGH = 3
+ACCURACY_FINE = 1
+ACCURACY_COARSE = 2
+
+
 class GpsServer:
     def __init__(self, port=8888):
         self.port = port
@@ -88,7 +107,16 @@ class GpsServer:
         self.state_file = get_state_file_path()
         self.foreground_ok = False
         self._last_status = "starting"
-        self.providers = ['gps', 'network', 'fused']
+
+        # 当前注入坐标（默认北京）
+        self.cur_lat = 39.9042
+        self.cur_lon = 116.4074
+        self.cur_alt = 55.0
+        self.cur_bearing = 0.0
+        self.cur_speed = 1.2
+
+        # 高频写入线程
+        self._inject_thread = None
 
         if IS_ANDROID and jnius is not None:
             try:
@@ -98,7 +126,6 @@ class GpsServer:
                 self.lm = self.service.getSystemService(
                     Context.LOCATION_SERVICE
                 )
-                self.provider = "gps"
                 _log("[Service] Android 服务初始化成功")
             except Exception as e:
                 _log(f"[Service] Android 初始化失败: {e}")
@@ -193,6 +220,85 @@ class GpsServer:
             _log(traceback.format_exc())
             self.foreground_ok = False
 
+    # ========================================================
+    # Provider 注册（对齐影梭：GPS 和 NETWORK 参数不同）
+    # ========================================================
+    def _remove_provider(self, name):
+        try:
+            if self.lm.isProviderEnabled(name):
+                self.lm.setTestProviderEnabled(name, False)
+                self.lm.removeTestProvider(name)
+        except Exception:
+            pass
+
+    def _add_gps_provider(self):
+        try:
+            BuildVERSION = jnius('android.os.Build$VERSION')
+            sdk_int = BuildVERSION.SDK_INT
+            if sdk_int >= 31:
+                # addTestProvider(name, requiresNetwork, requiresSatellite,
+                #                 requiresCell, hasMonetaryCost,
+                #                 supportsAltitude, supportsSpeed,
+                #                 supportsBearing, powerRequirement, accuracy)
+                self.lm.addTestProvider(
+                    GPS_PROVIDER,
+                    False,  # requiresNetwork
+                    True,   # requiresSatellite ← 影梭是 True
+                    False,  # requiresCell
+                    False,  # hasMonetaryCost
+                    True, True, True,    # altitude/speed/bearing
+                    POWER_USAGE_HIGH,    # ← 影梭用 HIGH
+                    ACCURACY_FINE
+                )
+            else:
+                Criteria = jnius('android.location.Criteria')
+                self.lm.addTestProvider(
+                    GPS_PROVIDER,
+                    False, True, False, False,
+                    True, True, True,
+                    Criteria.POWER_HIGH,
+                    Criteria.ACCURACY_FINE
+                )
+            if not self.lm.isProviderEnabled(GPS_PROVIDER):
+                self.lm.setTestProviderEnabled(GPS_PROVIDER, True)
+            _log("[Service] gps provider 注册成功")
+            return True
+        except Exception as e:
+            _log(f"[Service] gps provider 注册失败: {e}")
+            return False
+
+    def _add_network_provider(self):
+        try:
+            BuildVERSION = jnius('android.os.Build$VERSION')
+            sdk_int = BuildVERSION.SDK_INT
+            if sdk_int >= 31:
+                self.lm.addTestProvider(
+                    NETWORK_PROVIDER,
+                    True,   # requiresNetwork
+                    False,  # requiresSatellite
+                    True,   # requiresCell
+                    True,   # hasMonetaryCost
+                    True, True, True,
+                    POWER_USAGE_LOW,     # ← 影梭 network 用 LOW
+                    ACCURACY_COARSE      # ← 影梭 network 用 COARSE
+                )
+            else:
+                Criteria = jnius('android.location.Criteria')
+                self.lm.addTestProvider(
+                    NETWORK_PROVIDER,
+                    True, False, True, True,
+                    True, True, True,
+                    Criteria.POWER_LOW,
+                    Criteria.ACCURACY_COARSE
+                )
+            if not self.lm.isProviderEnabled(NETWORK_PROVIDER):
+                self.lm.setTestProviderEnabled(NETWORK_PROVIDER, True)
+            _log("[Service] network provider 注册成功")
+            return True
+        except Exception as e:
+            _log(f"[Service] network provider 注册失败: {e}")
+            return False
+
     def setup_provider(self):
         if not IS_ANDROID or jnius is None:
             self.provider_ready = True
@@ -200,23 +306,14 @@ class GpsServer:
             self.write_state(status="ready")
             return
 
-        ok_count = 0
-        for name in self.providers:
-            try:
-                self.lm.addTestProvider(
-                    name,
-                    False, False, False, False,
-                    True, True, True,
-                    1,
-                    1
-                )
-                self.lm.setTestProviderEnabled(name, True)
-                _log(f"[Service] {name} provider 注册成功")
-                ok_count += 1
-            except Exception as e:
-                _log(f"[Service] {name} provider 注册失败: {e}")
+        # 先移除旧的
+        self._remove_provider(GPS_PROVIDER)
+        self._remove_provider(NETWORK_PROVIDER)
 
-        if ok_count > 0:
+        ok1 = self._add_gps_provider()
+        ok2 = self._add_network_provider()
+
+        if ok1 or ok2:
             self.provider_ready = True
             self._last_status = "provider_ready"
             self.write_state(status="provider_ready")
@@ -226,41 +323,84 @@ class GpsServer:
             self.write_state(status="provider_error",
                              extra={"error": "all providers failed"})
 
+    # ========================================================
+    # 单次写入位置（GPS 和 NETWORK 分别写）
+    # ========================================================
+    def _write_location_gps(self):
+        try:
+            Location = jnius('android.location.Location')
+            SystemClock = jnius('android.os.SystemClock')
+            Bundle = jnius('android.os.Bundle')
+
+            loc = Location(GPS_PROVIDER)
+            loc.setAccuracy(ACCURACY_FINE)          # 影梭用的 1，不是 3.0
+            loc.setAltitude(self.cur_alt)
+            loc.setBearing(self.cur_bearing)
+            loc.setLatitude(self.cur_lat)
+            loc.setLongitude(self.cur_lon)
+            loc.setTime(int(time.time() * 1000))
+            loc.setSpeed(float(self.cur_speed))
+            loc.setElapsedRealtimeNanos(SystemClock.elapsedRealtimeNanos())
+
+            # 关键：模拟卫星数，影梭的做法
+            bundle = Bundle()
+            bundle.putInt("satellites", 7)
+            loc.setExtras(bundle)
+
+            self.lm.setTestProviderLocation(GPS_PROVIDER, loc)
+            return True
+        except Exception as e:
+            _log(f"[Service] GPS 写入失败: {e}")
+            return False
+
+    def _write_location_network(self):
+        try:
+            Location = jnius('android.location.Location')
+            SystemClock = jnius('android.os.SystemClock')
+
+            loc = Location(NETWORK_PROVIDER)
+            loc.setAccuracy(ACCURACY_COARSE)
+            loc.setAltitude(self.cur_alt)
+            loc.setBearing(self.cur_bearing)
+            loc.setLatitude(self.cur_lat)
+            loc.setLongitude(self.cur_lon)
+            loc.setTime(int(time.time() * 1000))
+            loc.setSpeed(float(self.cur_speed))
+            loc.setElapsedRealtimeNanos(SystemClock.elapsedRealtimeNanos())
+
+            self.lm.setTestProviderLocation(NETWORK_PROVIDER, loc)
+            return True
+        except Exception as e:
+            _log(f"[Service] NETWORK 写入失败: {e}")
+            return False
+
+    # ========================================================
+    # 高频写入线程（对齐影梭：每 100ms 无条件写一遍）
+    # ========================================================
+    def _inject_loop(self):
+        while self.running:
+            if self.provider_ready:
+                self._write_location_gps()
+                self._write_location_network()
+            time.sleep(0.1)   # 100ms
+
+    def start_inject_loop(self):
+        if self._inject_thread is None:
+            self._inject_thread = threading.Thread(
+                target=self._inject_loop, daemon=True
+            )
+            self._inject_thread.start()
+            _log("[Service] 高频注入线程已启动")
+
+    # ========================================================
+    # 收到新坐标：只更新 self.cur_*，高频线程会自动写入
+    # ========================================================
     def inject(self, lat, lon):
         if not self.provider_ready:
             return
         self.count += 1
-        if IS_ANDROID and jnius is not None:
-            try:
-                Location = jnius('android.location.Location')
-                SystemClock = jnius('android.os.SystemClock')
-                elapsed = SystemClock.elapsedRealtimeNanos()
-                # 关键修复：不用 Java 的 System，用 Python 的 time
-                now_ms = int(time.time() * 1000)
-
-                for name in self.providers:
-                    try:
-                        loc = Location(name)
-                        loc.setLatitude(lat)
-                        loc.setLongitude(lon)
-                        if name == 'gps':
-                            loc.setAccuracy(3.0)
-                        elif name == 'network':
-                            loc.setAccuracy(50.0)
-                        else:
-                            loc.setAccuracy(10.0)
-                        loc.setAltitude(50.0)
-                        loc.setTime(now_ms)
-                        loc.setElapsedRealtimeNanos(elapsed)
-                        self.lm.setTestProviderLocation(name, loc)
-                    except Exception as e:
-                        _log(f"[Service] {name} 注入失败: {e}")
-            except Exception as e:
-                _log(f"[Service] 注入异常: {e}")
-                _log(traceback.format_exc())
-        else:
-            if self.count % 10 == 1:
-                print(f"[Service] #{self.count}: {lat:.6f}, {lon:.6f}")
+        self.cur_lat = lat
+        self.cur_lon = lon
         self._last_status = "running"
         self.write_state(lat=lat, lon=lon, status="running")
 
@@ -299,6 +439,12 @@ class GpsServer:
         except Exception as e:
             _log(f"[Service] setup_provider 外层异常: {e}")
 
+        # 启动高频注入线程
+        try:
+            self.start_inject_loop()
+        except Exception as e:
+            _log(f"[Service] start_inject_loop 外层异常: {e}")
+
         try:
             while self.running:
                 try:
@@ -331,7 +477,6 @@ class GpsServer:
                         lat_str, lon_str = line.split(",")
                         self.inject(float(lat_str), float(lon_str))
                     except ValueError:
-                        # 忽略非 "lat,lon" 行（比如 HTTP/WebSocket 握手）
                         pass
         except Exception as e:
             _log(f"[Service] 客户端异常: {e}")
@@ -342,11 +487,8 @@ class GpsServer:
         self.running = False
         self.write_state(status="stopped")
         if IS_ANDROID and jnius is not None:
-            for name in getattr(self, 'providers', ['gps']):
-                try:
-                    self.lm.removeTestProvider(name)
-                except Exception:
-                    pass
+            self._remove_provider(GPS_PROVIDER)
+            self._remove_provider(NETWORK_PROVIDER)
 
 
 if __name__ == "__main__":
