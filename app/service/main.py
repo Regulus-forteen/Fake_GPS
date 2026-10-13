@@ -6,7 +6,7 @@
 完全对齐影梭（GoGoGo）的实现：
 - 只注册 GPS + NETWORK，不注册 FUSED
 - GPS / NETWORK 分别用不同参数
-- Location 带 satellites / bearing / speed
+- Location 带 satellites / bearing / speed / cn0
 - 独立线程每 100ms 无条件写一遍
 """
 import os
@@ -90,7 +90,6 @@ GPS_PROVIDER = "gps"
 NETWORK_PROVIDER = "network"
 
 # ProviderProperties（Android 12+，SDK_INT >= 31）
-# 值参考 android.location.provider.ProviderProperties
 POWER_USAGE_LOW = 1
 POWER_USAGE_MEDIUM = 2
 POWER_USAGE_HIGH = 3
@@ -221,7 +220,7 @@ class GpsServer:
             self.foreground_ok = False
 
     # ========================================================
-    # Provider 注册（对齐影梭：GPS 和 NETWORK 参数不同）
+    # Provider 注册
     # ========================================================
     def _remove_provider(self, name):
         try:
@@ -236,18 +235,14 @@ class GpsServer:
             BuildVERSION = jnius('android.os.Build$VERSION')
             sdk_int = BuildVERSION.SDK_INT
             if sdk_int >= 31:
-                # addTestProvider(name, requiresNetwork, requiresSatellite,
-                #                 requiresCell, hasMonetaryCost,
-                #                 supportsAltitude, supportsSpeed,
-                #                 supportsBearing, powerRequirement, accuracy)
                 self.lm.addTestProvider(
                     GPS_PROVIDER,
                     False,  # requiresNetwork
-                    True,   # requiresSatellite ← 影梭是 True
+                    True,   # requiresSatellite
                     False,  # requiresCell
                     False,  # hasMonetaryCost
                     True, True, True,    # altitude/speed/bearing
-                    POWER_USAGE_HIGH,    # ← 影梭用 HIGH
+                    POWER_USAGE_HIGH,
                     ACCURACY_FINE
                 )
             else:
@@ -279,8 +274,8 @@ class GpsServer:
                     True,   # requiresCell
                     True,   # hasMonetaryCost
                     True, True, True,
-                    POWER_USAGE_LOW,     # ← 影梭 network 用 LOW
-                    ACCURACY_COARSE      # ← 影梭 network 用 COARSE
+                    POWER_USAGE_LOW,
+                    ACCURACY_COARSE
                 )
             else:
                 Criteria = jnius('android.location.Criteria')
@@ -306,7 +301,6 @@ class GpsServer:
             self.write_state(status="ready")
             return
 
-        # 先移除旧的
         self._remove_provider(GPS_PROVIDER)
         self._remove_provider(NETWORK_PROVIDER)
 
@@ -324,7 +318,7 @@ class GpsServer:
                              extra={"error": "all providers failed"})
 
     # ========================================================
-    # 单次写入位置（GPS 和 NETWORK 分别写）
+    # 单次写入位置
     # ========================================================
     def _write_location_gps(self):
         try:
@@ -333,7 +327,7 @@ class GpsServer:
             Bundle = jnius('android.os.Bundle')
 
             loc = Location(GPS_PROVIDER)
-            loc.setAccuracy(ACCURACY_FINE)          # 影梭用的 1，不是 3.0
+            loc.setAccuracy(3.0)                    # 3 米精度（真实手机典型值）
             loc.setAltitude(self.cur_alt)
             loc.setBearing(self.cur_bearing)
             loc.setLatitude(self.cur_lat)
@@ -342,9 +336,14 @@ class GpsServer:
             loc.setSpeed(float(self.cur_speed))
             loc.setElapsedRealtimeNanos(SystemClock.elapsedRealtimeNanos())
 
-            # 关键：模拟卫星数，影梭的做法
+            # 关键：模拟强 GPS 信号
             bundle = Bundle()
-            bundle.putInt("satellites", 7)
+            bundle.putInt("satellites", 18)         # 参与的卫星数
+            try:
+                bundle.putFloat("maxCn0", 45.0)     # 最强信号载噪比（dB-Hz）
+                bundle.putFloat("meanCn0", 32.0)    # 平均载噪比
+            except Exception:
+                pass
             loc.setExtras(bundle)
 
             self.lm.setTestProviderLocation(GPS_PROVIDER, loc)
@@ -359,7 +358,7 @@ class GpsServer:
             SystemClock = jnius('android.os.SystemClock')
 
             loc = Location(NETWORK_PROVIDER)
-            loc.setAccuracy(ACCURACY_COARSE)
+            loc.setAccuracy(50.0)                   # 网络定位精度 50 米
             loc.setAltitude(self.cur_alt)
             loc.setBearing(self.cur_bearing)
             loc.setLatitude(self.cur_lat)
@@ -375,7 +374,7 @@ class GpsServer:
             return False
 
     # ========================================================
-    # 高频写入线程（对齐影梭：每 100ms 无条件写一遍）
+    # 高频写入线程
     # ========================================================
     def _inject_loop(self):
         while self.running:
@@ -393,7 +392,7 @@ class GpsServer:
             _log("[Service] 高频注入线程已启动")
 
     # ========================================================
-    # 收到新坐标：只更新 self.cur_*，高频线程会自动写入
+    # 收到新坐标
     # ========================================================
     def inject(self, lat, lon):
         if not self.provider_ready:
@@ -439,7 +438,6 @@ class GpsServer:
         except Exception as e:
             _log(f"[Service] setup_provider 外层异常: {e}")
 
-        # 启动高频注入线程
         try:
             self.start_inject_loop()
         except Exception as e:
