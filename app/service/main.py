@@ -88,7 +88,6 @@ class GpsServer:
         self.state_file = get_state_file_path()
         self.foreground_ok = False
         self._last_status = "starting"
-        # 三源：gps（GPS 芯片）、network（WiFi/基站）、fused（融合定位）
         self.providers = ['gps', 'network', 'fused']
 
         if IS_ANDROID and jnius is not None:
@@ -99,7 +98,7 @@ class GpsServer:
                 self.lm = self.service.getSystemService(
                     Context.LOCATION_SERVICE
                 )
-                self.provider = "gps"   # 兼容旧代码
+                self.provider = "gps"
                 _log("[Service] Android 服务初始化成功")
             except Exception as e:
                 _log(f"[Service] Android 初始化失败: {e}")
@@ -208,8 +207,8 @@ class GpsServer:
                     name,
                     False, False, False, False,
                     True, True, True,
-                    1,   # powerRequirement = POWER_LOW
-                    1    # accuracy = ACCURACY_FINE
+                    1,
+                    1
                 )
                 self.lm.setTestProviderEnabled(name, True)
                 _log(f"[Service] {name} provider 注册成功")
@@ -236,9 +235,9 @@ class GpsServer:
                 Location = jnius('android.location.Location')
                 SystemClock = jnius('android.os.SystemClock')
                 elapsed = SystemClock.elapsedRealtimeNanos()
-                now_ms = System.currentTimeMillis()
+                # 关键修复：不用 Java 的 System，用 Python 的 time
+                now_ms = int(time.time() * 1000)
 
-                # 三源同时注入
                 for name in self.providers:
                     try:
                         loc = Location(name)
@@ -258,6 +257,7 @@ class GpsServer:
                         _log(f"[Service] {name} 注入失败: {e}")
             except Exception as e:
                 _log(f"[Service] 注入异常: {e}")
+                _log(traceback.format_exc())
         else:
             if self.count % 10 == 1:
                 print(f"[Service] #{self.count}: {lat:.6f}, {lon:.6f}")
@@ -331,7 +331,8 @@ class GpsServer:
                         lat_str, lon_str = line.split(",")
                         self.inject(float(lat_str), float(lon_str))
                     except ValueError:
-                        _log(f"[Service] 格式错误: {line}")
+                        # 忽略非 "lat,lon" 行（比如 HTTP/WebSocket 握手）
+                        pass
         except Exception as e:
             _log(f"[Service] 客户端异常: {e}")
         finally:
