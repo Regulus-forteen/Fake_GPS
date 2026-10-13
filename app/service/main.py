@@ -3,11 +3,12 @@
 - Android: 监听 TCP + 注入 GPS/Network + 每100ms高频写 + 写 state.json
 - 桌面: 监听 TCP + 只写 state.json
 
-完全对齐影梭（GoGoGo）的实现：
-- 只注册 GPS + NETWORK，不注册 FUSED
+对齐影梭（GoGoGo）的实现：
+- 只注册 GPS + NETWORK
 - GPS / NETWORK 分别用不同参数
-- Location 带 satellites / bearing / speed / cn0
+- Location 带 satellites / bearing / speed
 - 独立线程每 100ms 无条件写一遍
+- 持有 PARTIAL_WAKE_LOCK，防止后台被冻结
 """
 import os
 import sys
@@ -89,7 +90,6 @@ def get_state_file_path():
 GPS_PROVIDER = "gps"
 NETWORK_PROVIDER = "network"
 
-# ProviderProperties（Android 12+，SDK_INT >= 31）
 POWER_USAGE_LOW = 1
 POWER_USAGE_MEDIUM = 2
 POWER_USAGE_HIGH = 3
@@ -107,7 +107,7 @@ class GpsServer:
         self.foreground_ok = False
         self._last_status = "starting"
 
-        # 当前注入坐标（默认北京）
+        # 当前注入坐标
         self.cur_lat = 39.9042
         self.cur_lon = 116.4074
         self.cur_alt = 55.0
@@ -116,6 +116,8 @@ class GpsServer:
 
         # 高频写入线程
         self._inject_thread = None
+        # WakeLock
+        self._wake_lock = None
 
         if IS_ANDROID and jnius is not None:
             try:
@@ -132,6 +134,36 @@ class GpsServer:
                 self.service = None
                 self.lm = None
 
+    # ========================================================
+    # WakeLock：防止后台被冻结
+    # ========================================================
+    def acquire_wakelock(self):
+        if not IS_ANDROID or jnius is None:
+            return
+        try:
+            Context = jnius('android.content.Context')
+            PowerManager = jnius('android.os.PowerManager')
+            pm = self.service.getSystemService(Context.POWER_SERVICE)
+            self._wake_lock = pm.newWakeLock(
+                PowerManager.PARTIAL_WAKE_LOCK,
+                "gpsreceiver::InjectLoop"
+            )
+            self._wake_lock.acquire()
+            _log("[Service] WakeLock 已获取")
+        except Exception as e:
+            _log(f"[Service] WakeLock 获取失败: {e}")
+            self._wake_lock = None
+
+    def release_wakelock(self):
+        if self._wake_lock is not None:
+            try:
+                self._wake_lock.release()
+                _log("[Service] WakeLock 已释放")
+            except Exception:
+                pass
+            self._wake_lock = None
+
+    # ========================================================
     def write_state(self, lat=None, lon=None, status="running", extra=None):
         try:
             data = {
@@ -241,7 +273,7 @@ class GpsServer:
                     True,   # requiresSatellite
                     False,  # requiresCell
                     False,  # hasMonetaryCost
-                    True, True, True,    # altitude/speed/bearing
+                    True, True, True,
                     POWER_USAGE_HIGH,
                     ACCURACY_FINE
                 )
@@ -311,6 +343,13 @@ class GpsServer:
             self.provider_ready = True
             self._last_status = "provider_ready"
             self.write_state(status="provider_ready")
+            # 注册完立即写一次，覆盖系统缓存
+            try:
+                self._write_location_gps()
+                self._write_location_network()
+                _log("[Service] 初始化位置已写入")
+            except Exception as e:
+                _log(f"[Service] 初始写入失败: {e}")
         else:
             self.provider_ready = False
             self._last_status = "provider_error"
@@ -327,7 +366,7 @@ class GpsServer:
             Bundle = jnius('android.os.Bundle')
 
             loc = Location(GPS_PROVIDER)
-            loc.setAccuracy(3.0)                    # 3 米精度（真实手机典型值）
+            loc.setAccuracy(3.0)
             loc.setAltitude(self.cur_alt)
             loc.setBearing(self.cur_bearing)
             loc.setLatitude(self.cur_lat)
@@ -336,12 +375,11 @@ class GpsServer:
             loc.setSpeed(float(self.cur_speed))
             loc.setElapsedRealtimeNanos(SystemClock.elapsedRealtimeNanos())
 
-            # 关键：模拟强 GPS 信号
             bundle = Bundle()
-            bundle.putInt("satellites", 18)         # 参与的卫星数
+            bundle.putInt("satellites", 7)          # 改回 7，避免冲突
             try:
-                bundle.putFloat("maxCn0", 45.0)     # 最强信号载噪比（dB-Hz）
-                bundle.putFloat("meanCn0", 32.0)    # 平均载噪比
+                bundle.putFloat("maxCn0", 38.0)
+                bundle.putFloat("meanCn0", 28.0)
             except Exception:
                 pass
             loc.setExtras(bundle)
@@ -358,7 +396,7 @@ class GpsServer:
             SystemClock = jnius('android.os.SystemClock')
 
             loc = Location(NETWORK_PROVIDER)
-            loc.setAccuracy(50.0)                   # 网络定位精度 50 米
+            loc.setAccuracy(50.0)
             loc.setAltitude(self.cur_alt)
             loc.setBearing(self.cur_bearing)
             loc.setLatitude(self.cur_lat)
@@ -381,7 +419,7 @@ class GpsServer:
             if self.provider_ready:
                 self._write_location_gps()
                 self._write_location_network()
-            time.sleep(0.1)   # 100ms
+            time.sleep(0.1)
 
     def start_inject_loop(self):
         if self._inject_thread is None:
@@ -391,8 +429,6 @@ class GpsServer:
             self._inject_thread.start()
             _log("[Service] 高频注入线程已启动")
 
-    # ========================================================
-    # 收到新坐标
     # ========================================================
     def inject(self, lat, lon):
         if not self.provider_ready:
@@ -405,6 +441,9 @@ class GpsServer:
 
     def serve(self):
         self.write_state(status="starting")
+
+        # 先请求 WakeLock，防止后台被冻结
+        self.acquire_wakelock()
 
         try:
             server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -487,6 +526,7 @@ class GpsServer:
         if IS_ANDROID and jnius is not None:
             self._remove_provider(GPS_PROVIDER)
             self._remove_provider(NETWORK_PROVIDER)
+        self.release_wakelock()
 
 
 if __name__ == "__main__":
