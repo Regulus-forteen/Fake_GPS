@@ -87,6 +87,7 @@ class GpsServer:
         self.count = 0
         self.state_file = get_state_file_path()
         self.foreground_ok = False
+        self._last_status = "starting"
 
         if IS_ANDROID and jnius is not None:
             try:
@@ -135,64 +136,92 @@ class GpsServer:
             NotificationBuilder = jnius('android.app.Notification$Builder')
             NotificationChannel = jnius('android.app.NotificationChannel')
             NotificationManager = jnius('android.app.NotificationManager')
-            Build = jnius('android.os.Build')
+            # 关键：嵌套类必须写 Build$VERSION
+            BuildVERSION = jnius('android.os.Build$VERSION')
             Context = jnius('android.content.Context')
 
-            if Build.VERSION.SDK_INT >= 26:
-                channel = NotificationChannel(
-                    "gps_receiver", "GPS 接收器",
-                    NotificationManager.IMPORTANCE_LOW
-                )
-                nm = self.service.getSystemService(Context.NOTIFICATION_SERVICE)
-                nm.createNotificationChannel(channel)
+            sdk_int = BuildVERSION.SDK_INT
+            _log(f"[Service] SDK_INT = {sdk_int}")
 
-            Icon = jnius('android.R$drawable')
-            builder = NotificationBuilder(self.service, "gps_receiver")
-            builder.setContentTitle("GPS 接收器运行中")
-            builder.setContentText(f"监听端口 {self.port}")
-            builder.setSmallIcon(Icon.ic_menu_mylocation)
-            builder.setOngoing(True)
-            notif = builder.build()
+            if sdk_int >= 26:
+                try:
+                    channel = NotificationChannel(
+                        "gps_receiver", "GPS 接收器",
+                        NotificationManager.IMPORTANCE_LOW
+                    )
+                    nm = self.service.getSystemService(
+                        Context.NOTIFICATION_SERVICE)
+                    nm.createNotificationChannel(channel)
+                except Exception as e:
+                    _log(f"[Service] createChannel 失败: {e}")
 
-            if Build.VERSION.SDK_INT >= 34:
+            notif = None
+            try:
+                Icon = jnius('android.R$drawable')
+                builder = NotificationBuilder(self.service, "gps_receiver")
+                builder.setContentTitle("GPS 接收器运行中")
+                builder.setContentText(f"监听端口 {self.port}")
+                builder.setSmallIcon(Icon.ic_menu_mylocation)
+                builder.setOngoing(True)
+                notif = builder.build()
+            except Exception as e:
+                _log(f"[Service] 构造通知失败: {e}")
+
+            if notif is None:
+                _log("[Service] 无法构造通知，跳过前台化")
+                self.foreground_ok = False
+                return
+
+            if sdk_int >= 34:
                 try:
                     self.service.startForeground(1001, notif, 8)
                     self.foreground_ok = True
                     _log("[Service] startForeground(3args) OK")
+                    return
                 except Exception as e:
                     _log(f"[Service] 3args 失败: {e}")
-                    try:
-                        self.service.startForeground(1001, notif)
-                        self.foreground_ok = True
-                        _log("[Service] startForeground(2args) OK")
-                    except Exception as e2:
-                        _log(f"[Service] 2args 也失败: {e2}")
-            else:
+
+            try:
                 self.service.startForeground(1001, notif)
                 self.foreground_ok = True
-                _log("[Service] startForeground OK")
+                _log("[Service] startForeground(2args) OK")
+            except Exception as e:
+                _log(f"[Service] 2args 也失败: {e}")
+                self.foreground_ok = False
         except Exception as e:
-            _log(f"[Service] start_foreground 整体失败: {e}")
+            _log(f"[Service] start_foreground 顶层失败: {e}")
             _log(traceback.format_exc())
+            self.foreground_ok = False
 
     def setup_provider(self):
         if not IS_ANDROID or jnius is None:
             self.provider_ready = True
+            self._last_status = "ready"
             self.write_state(status="ready")
             return
         try:
+            # 参数：
+            # name, requiresNetwork, requiresSatellite, requiresCell,
+            # hasMonetaryCost, supportsAltitude, supportsSpeed,
+            # supportsBearing, powerRequirement, accuracy
+            # powerRequirement: 1=POWER_LOW, 2=POWER_MEDIUM, 3=POWER_HIGH
+            # accuracy: 1=ACCURACY_FINE, 2=ACCURACY_COARSE
             self.lm.addTestProvider(
                 self.provider,
                 False, False, False, False,
-                True, True, True, 0, 5
+                True, True, True,
+                1,    # POWER_LOW
+                1     # ACCURACY_FINE
             )
             self.lm.setTestProviderEnabled(self.provider, True)
             self.provider_ready = True
+            self._last_status = "provider_ready"
             _log("[Service] Provider 注册成功")
             self.write_state(status="provider_ready")
         except Exception as e:
             _log(f"[Service] addTestProvider 失败: {e}")
             self.provider_ready = False
+            self._last_status = "provider_error"
             self.write_state(status="provider_error",
                              extra={"error": str(e)})
 
@@ -217,13 +246,13 @@ class GpsServer:
         else:
             if self.count % 10 == 1:
                 print(f"[Service] #{self.count}: {lat:.6f}, {lon:.6f}")
+        self._last_status = "running"
         self.write_state(lat=lat, lon=lon, status="running")
 
     def serve(self):
         self.write_state(status="starting")
-        self.start_foreground()
-        self.setup_provider()
 
+        # 先监听端口
         try:
             server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -231,12 +260,34 @@ class GpsServer:
             server.listen(5)
             _log(f"[Service] 监听 0.0.0.0:{self.port}")
             _log(f"[Service] state: {self.state_file}")
+            self._last_status = "listening"
             self.write_state(status="listening")
+
+            def _heartbeat():
+                while self.running:
+                    time.sleep(5)
+                    if not self.running:
+                        break
+                    self.write_state(status=self._last_status)
+            threading.Thread(target=_heartbeat, daemon=True).start()
         except Exception as e:
             _log(f"[Service] bind 失败: {e}")
             self.write_state(status="bind_error", extra={"error": str(e)})
             return
 
+        # 再前台服务
+        try:
+            self.start_foreground()
+        except Exception as e:
+            _log(f"[Service] start_foreground 外层异常: {e}")
+
+        # 再注册 provider
+        try:
+            self.setup_provider()
+        except Exception as e:
+            _log(f"[Service] setup_provider 外层异常: {e}")
+
+        # 处理连接
         try:
             while self.running:
                 try:
@@ -287,29 +338,34 @@ class GpsServer:
 
 if __name__ == "__main__":
     _init_log()
-    _log("=" * 40)
+    _log("=" * 60)
     _log(f"[Service] 启动, IS_ANDROID={IS_ANDROID}")
 
-    port = 8888
-    if IS_ANDROID:
-        arg = os.environ.get('PYTHON_SERVICE_ARGUMENT', '')
-        _log(f"[Service] PYTHON_SERVICE_ARGUMENT={arg!r}")
-        if arg:
-            try:
-                port = int(arg)
-            except ValueError:
-                _log(f"[Service] 参数不是数字: {arg!r}，用默认 {port}")
-    else:
-        parser = argparse.ArgumentParser()
-        parser.add_argument("--port", type=int, default=8888)
-        args = parser.parse_args()
-        port = args.port
-
-    _log(f"[Service] 最终端口: {port}")
-
     try:
+        _log("[Service] step1: 解析端口")
+        port = 8888
+        if IS_ANDROID:
+            arg = os.environ.get('PYTHON_SERVICE_ARGUMENT', '')
+            _log(f"[Service] PYTHON_SERVICE_ARGUMENT={arg!r}")
+            if arg:
+                try:
+                    port = int(arg)
+                except ValueError:
+                    pass
+        else:
+            parser = argparse.ArgumentParser()
+            parser.add_argument("--port", type=int, default=8888)
+            args = parser.parse_args()
+            port = args.port
+        _log(f"[Service] 端口={port}")
+
+        _log("[Service] step2: 创建 GpsServer")
         server = GpsServer(port=port)
+        _log("[Service] GpsServer 创建完成")
+
+        _log("[Service] step3: 开始 serve()")
         server.serve()
+        _log("[Service] serve() 返回（不该到这）")
     except Exception as e:
         _log(f"[Service] 顶层崩溃: {e}")
         _log(traceback.format_exc())

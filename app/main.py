@@ -60,10 +60,10 @@ if IS_ANDROID:
 
 
 # ============================================================
-# 定位权限 + 真实位置
+# 定位权限 + 通知权限 + 真实位置
 # ============================================================
 def request_location_permissions(callback=None):
-    """请求运行时定位权限。callback(granted: bool)"""
+    """请求定位 + 通知权限"""
     if not IS_ANDROID:
         if callback:
             callback(True)
@@ -72,8 +72,15 @@ def request_location_permissions(callback=None):
         from android.permissions import (
             request_permissions, Permission, check_permission
         )
-        if check_permission(Permission.ACCESS_FINE_LOCATION):
-            print("[Perm] 已有定位权限")
+        needed = [Permission.ACCESS_FINE_LOCATION,
+                  Permission.ACCESS_COARSE_LOCATION]
+        # Android 13+ 通知权限（前台服务需要）
+        if hasattr(Permission, 'POST_NOTIFICATIONS'):
+            needed.append(Permission.POST_NOTIFICATIONS)
+
+        missing = [p for p in needed if not check_permission(p)]
+        if not missing:
+            print("[Perm] 已有全部权限")
             if callback:
                 callback(True)
             return
@@ -84,11 +91,7 @@ def request_location_permissions(callback=None):
             if callback:
                 callback(ok)
 
-        request_permissions(
-            [Permission.ACCESS_FINE_LOCATION,
-             Permission.ACCESS_COARSE_LOCATION],
-            _cb
-        )
+        request_permissions(missing, _cb)
     except Exception as e:
         print(f"[Perm] 请求失败: {e}")
         if callback:
@@ -96,7 +99,7 @@ def request_location_permissions(callback=None):
 
 
 def get_real_location():
-    """获取真实 GPS 位置。返回 (lat, lon) WGS-84，或 None"""
+    """获取真实 GPS 位置，返回 (lat, lon) WGS-84 或 None"""
     if not IS_ANDROID:
         return None
     try:
@@ -107,7 +110,6 @@ def get_real_location():
         lm = activity.getSystemService(Context.LOCATION_SERVICE)
 
         best = None
-        # 从三种 provider 里挑时间最新的
         for name in ['gps', 'network', 'passive']:
             try:
                 loc = lm.getLastKnownLocation(name)
@@ -604,7 +606,6 @@ class ReceiverUI(FloatLayout):
         )
         self.add_widget(main)
 
-        # ---------- 标题 ----------
         title_row = BoxLayout(size_hint_y=None, height=dp(36), spacing=dp(6))
         title = Label(
             text="GPS 模拟位置", font_size=dp(18),
@@ -627,7 +628,6 @@ class ReceiverUI(FloatLayout):
         title_row.add_widget(self.status_badge)
         main.add_widget(title_row)
 
-        # ---------- 状态卡片 ----------
         card = Card(size_hint_y=None, height=dp(138),
                     orientation='vertical',
                     padding=[dp(14), dp(10), dp(14), dp(10)],
@@ -651,7 +651,6 @@ class ReceiverUI(FloatLayout):
 
         main.add_widget(card)
 
-        # ---------- 地图 ----------
         map_card = Card(
             orientation='vertical',
             padding=[dp(2), dp(2), dp(2), dp(2)],
@@ -674,7 +673,6 @@ class ReceiverUI(FloatLayout):
         map_card.add_widget(map_container)
         main.add_widget(map_card)
 
-        # ---------- 图层 ----------
         self._track_line = MapTrackLayer(self.mapview)
         self.mapview.add_widget(self._track_line)
         self._track_line.pos = (0, 0)
@@ -693,7 +691,6 @@ class ReceiverUI(FloatLayout):
 
         self._map_card = map_card
 
-        # ---------- 底部 ----------
         bottom_card = Card(
             orientation='vertical',
             size_hint_y=None, height=dp(104),
@@ -747,7 +744,6 @@ class ReceiverUI(FloatLayout):
 
         main.add_widget(bottom_card)
 
-        # ---------- 悬浮按钮 ----------
         btn_size = dp(46)
         self._btn_locate = CircleIconButton(
             icon_type="locate",
@@ -772,7 +768,6 @@ class ReceiverUI(FloatLayout):
         Clock.schedule_once(self._position_buttons, 0.3)
         Clock.schedule_once(self._position_buttons, 1.0)
 
-        # ---------- 状态 ----------
         self.service_running = False
         self.state_reader = StateReader()
         self.last_count = 0
@@ -799,7 +794,6 @@ class ReceiverUI(FloatLayout):
         self._btn_locate.pos = (x, y_locate)
 
     def _initial_center(self, dt):
-        # 优先用 state.json 里的历史位置
         state = self.state_reader.read()
         if state and state.get('lat') is not None:
             lat, lon = wgs84_to_gcj02(state['lat'], state['lon'])
@@ -807,10 +801,8 @@ class ReceiverUI(FloatLayout):
             self.current_lon = lon
             self.mapview.center_on(lat, lon)
             self._dot_layer.set_position(lat, lon)
-            # 顺便请求权限，供后续使用
             request_location_permissions()
             return
-        # 无历史位置 → 请求权限 + 拿真实 GPS
         request_location_permissions(callback=self._on_perm_result)
 
     def _on_perm_result(self, granted):
@@ -830,12 +822,10 @@ class ReceiverUI(FloatLayout):
             self._dot_layer.set_position(lat, lon)
 
     def locate_current(self, *args):
-        # 有模拟位置 → 跳到最后一个模拟点
         if self.track_points:
             lat, lon = self.track_points[-1]
             self.mapview.center_on(lat, lon)
             return
-        # 无模拟位置 → 重新获取真实位置
         real = get_real_location()
         if real is not None:
             lat, lon = wgs84_to_gcj02(real[0], real[1])
@@ -960,7 +950,7 @@ class ReceiverUI(FloatLayout):
             return
 
         age = _time.time() - state.get('timestamp', 0)
-        if age > 15:
+        if age > 20:
             self.row_status.set_value(f"service 已失联({int(age)}s)",
                                       COLOR_DANGER)
             self.row_status.set_dot_color(COLOR_DANGER)
@@ -981,7 +971,9 @@ class ReceiverUI(FloatLayout):
             self.row_status.set_value("启动中...", COLOR_WARN)
             self.row_status.set_dot_color(COLOR_WARN)
         elif svc_status == 'provider_error':
-            self.row_status.set_value("GPS 注入权限缺失", COLOR_DANGER)
+            err = state.get('error', '')
+            self.row_status.set_value(f"GPS 注入失败: {err[:30]}",
+                                      COLOR_DANGER)
             self.row_status.set_dot_color(COLOR_DANGER)
         elif svc_status == 'bind_error':
             self.row_status.set_value("端口被占用", COLOR_DANGER)
