@@ -133,8 +133,16 @@ jobs:
           git clone --depth=1 -b master \
             https://github.com/kivy/python-for-android.git "$P4A_DIR"
           cd "$P4A_DIR"
-          python3 -c " path = 'pythonforandroid/build.py' src = open(path).read() old = '\"source venv/bin/activate && pip install -U pip\"' new = '\"source venv/bin/activate\"' assert old in src, '目标代码未找到' open(path, 'w').write(src.replace(old, new)) print('✅ 补丁成功') "
-
+          python3 - <<'PY'
+          path = 'pythonforandroid/build.py'
+          src = open(path).read()
+          old = 'source venv/bin/activate && pip install -U pip'
+          new = 'source venv/bin/activate'
+          assert old in src, '目标代码未找到'
+          open(path, 'w').write(src.replace(old, new))
+          print('补丁成功')
+          PY
+          
       - name: 恢复 Buildozer 缓存
         id: cache-restore
         uses: actions/cache/restore@v4
