@@ -221,15 +221,32 @@ jobs:
           APKS=$(ls bin/*.apk 2>/dev/null || true)
           [ -n "$APKS" ] || { echo "::error::没有生成 APK"; exit 1; }
 
+          # 找 apksigner（build-tools 里，版本号最大的那个）
           SIGNER=$(find "$ANDROID_HOME/build-tools" -name apksigner -type f 2>/dev/null | sort -V | tail -1 || true)
+          if [ -z "$SIGNER" ]; then
+            echo "::error::找不到 apksigner"
+            exit 1
+          fi
+          echo "使用 apksigner: $SIGNER"
+
           for apk in $APKS; do
             echo "=== $apk ==="
-            if [ -n "$SIGNER" ]; then
-              "$SIGNER" verify --print-certs "$apk" | head -20
-            else
-              unzip -l "$apk" | grep -E "META-INF/(CERT|.*\\.RSA)" || {
-                echo "::error::$apk 未签名"; exit 1; }
+
+            # apksigner verify 退出码非 0 即为签名无效（支持 v1/v2/v3）
+            if ! "$SIGNER" verify --verbose --print-certs "$apk"; then
+              echo "::error::$apk 签名校验失败"
+              exit 1
             fi
+
+            # 从证书里确认不是调试证书
+            CERT=$("$SIGNER" verify --print-certs "$apk" 2>/dev/null)
+            if echo "$CERT" | grep -qi "Android Debug"; then
+              echo "::error::$apk 使用的是调试证书，不能作为正式版发布"
+              exit 1
+            fi
+
+            echo "$CERT" | grep -iE "Signer #1 certificate DN|SHA-256 digest" || true
+            echo "签名校验通过"
           done
 
       - name: 上传 APK

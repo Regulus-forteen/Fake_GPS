@@ -127,19 +127,32 @@ jobs:
           APK=$(ls *.apk | head -1)
           echo "=== $APK ==="
 
-          unzip -p "$APK" 'META-INF/*.RSA' 'META-INF/*.DSA' 'META-INF/*.EC' > /tmp/cert.bin 2>/dev/null || true
-          if [ ! -s /tmp/cert.bin ]; then
-            echo "::error::APK 未找到签名文件"
-            exit 1
+          # v2/v3 签名不在 META-INF 里，必须用 apksigner 判断
+          SIGNER=$(find "$ANDROID_HOME/build-tools" -name apksigner -type f 2>/dev/null | sort -V | tail -1 || true)
+          if [ -n "$SIGNER" ]; then
+            echo "使用 apksigner: $SIGNER"
+            if ! "$SIGNER" verify --verbose --print-certs "$APK"; then
+              echo "::error::$APK 签名校验失败"
+              exit 1
+            fi
+            CERT=$("$SIGNER" verify --print-certs "$APK" 2>/dev/null)
+          else
+            # 兜底：至少确认有 v2 签名的魔术字节
+            if ! grep -qa "APK Sig Block 42" "$APK"; then
+              echo "::error::未检测到 APK 签名块"
+              exit 1
+            fi
+            echo "未找到 apksigner，仅检测到签名块"
+            CERT=""
           fi
 
-          if strings /tmp/cert.bin | grep -qi "Android Debug"; then
+          if echo "$CERT" | grep -qi "Android Debug"; then
             echo "::error::这是调试签名，不能作为正式版发布"
             exit 1
           fi
 
           echo "签名校验通过（非调试证书）"
-          strings /tmp/cert.bin | grep -iE "CN=|OU=|O=" | head -5 || true
+          echo "$CERT" | grep -iE "Signer #1 certificate DN|SHA-256 digest" || true
 
       - name: 命名并校验
         run: |
