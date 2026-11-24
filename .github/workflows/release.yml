@@ -1,185 +1,123 @@
 name: Release
 
+# 只负责把已构建好的 APK 发布成 Release，不重复编译。
+# APK 由 workflow.yml 在 push 到 master 时构建并上传为 artifact（名为 apk）。
+
 on:
-  push:
-    tags:
-      - 'v*'
+  workflow_run:
+    workflows: ["Build APK"]
+    types: [completed]
+    branches: [master, main]
   workflow_dispatch:
     inputs:
-      version:
-        description: '要发布的版本号（例如 v1.0.0），留空则使用最新 tag'
+      tag:
+        description: '要发布的版本号（例如 v0.1.0）；留空则自动生成'
+        required: false
+        type: string
+      run_id:
+        description: '指定要取 artifact 的 Build APK run id；留空则取最近一次成功的'
         required: false
         type: string
 
 permissions:
   contents: write
-  actions: write
+  actions: read
 
 jobs:
-  build-android:
-    runs-on: ubuntu-22.04
+  release:
+    # workflow_run 触发时，只在上游构建成功时执行
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-latest
 
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
-
-      - name: 确定版本号
-        id: version
-        run: |
-          if [ -n "${{ inputs.version }}" ]; then
-            VER="${{ inputs.version }}"
-          elif [ -n "${{ github.ref_name }}" ] && [[ "${{ github.ref_name }}" == v* ]]; then
-            VER="${{ github.ref_name }}"
-          else
-            VER="v$(date +%Y.%m.%d)-manual"
-          fi
-          echo "value=$VER" >> $GITHUB_OUTPUT
-          echo "版本号: $VER"
-
-      - name: 同步版本号到 buildozer.spec
-        run: |
-          VER="${{ steps.version.outputs.value }}"
-          # v1.2.3 -> 1.2.3；非法格式则回落到日期
-          SEMVER=$(echo "$VER" | sed -E 's/^v//')
-          if ! echo "$SEMVER" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
-            SEMVER="0.0.$(date +%Y%m%d)"
-          fi
-          echo "APK versionName: $SEMVER"
-          python3 - "$SEMVER" <<'PY'
-          import re, sys
-          ver = sys.argv[1]
-          path = 'app/buildozer.spec'
-          src = open(path, encoding='utf-8').read()
-          new, n = re.subn(r'(?m)^version\s*=.*$', f'version = {ver}', src)
-          assert n == 1, 'version 行数量异常'
-          open(path, 'w', encoding='utf-8').write(new)
-          print('已写入 version =', ver)
-          PY
-          grep -E '^(title|package\.name|package\.domain|version|icon\.|presplash\.)' app/buildozer.spec
-
-      - name: 释放磁盘空间
-        run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android/sdk/ndk
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          sudo rm -rf /usr/local/share/boost
-          sudo rm -rf /usr/share/swift
-          sudo rm -rf /usr/local/lib/node_modules
-          sudo rm -rf /opt/hostedtoolcache/PyPy
-          sudo rm -rf /opt/hostedtoolcache/node
-          sudo apt-get clean
-          df -h /
-
-      - name: 安装系统依赖
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            git zip unzip openjdk-17-jdk \
-            autoconf automake libtool libtool-bin \
-            libltdl-dev pkg-config gettext \
-            zlib1g-dev libncurses-dev cmake \
-            libffi-dev libssl-dev
-
-      - name: 设置 Python
-        uses: actions/setup-python@v5
         with:
-          python-version: '3.11.5'
+          fetch-depth: 0
 
-      - name: 切换到 Java 17
-        run: |
-          echo "JAVA_HOME=/usr/lib/jvm/temurin-17-jdk-amd64" >> $GITHUB_ENV
-          echo "PATH=/usr/lib/jvm/temurin-17-jdk-amd64/bin:$PATH" >> $GITHUB_ENV
-          java -version
-
-      - name: 安装 Buildozer 和 Cython
-        run: |
-          pip install --upgrade pip
-          pip install buildozer cython==0.29.36
-
-      - name: 手动 clone p4a master 并 patch pip 升级
-        working-directory: app
+      - name: 确定版本号与来源 run
+        id: meta
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -e
-          P4A_DIR=".buildozer/android/platform/python-for-android"
-          mkdir -p "$(dirname "$P4A_DIR")"
-          rm -rf "$P4A_DIR"
-          git clone --depth=1 -b master \
-            https://github.com/kivy/python-for-android.git "$P4A_DIR"
-          cd "$P4A_DIR"
-          python3 -c "
-          path = 'pythonforandroid/build.py'
-          src = open(path).read()
-          old = '\"source venv/bin/activate && pip install -U pip\"'
-          new = '\"source venv/bin/activate\"'
-          assert old in src, '目标代码未找到'
-          open(path, 'w').write(src.replace(old, new))
-          print('补丁成功')
-          "
 
-      - name: 恢复 Buildozer 缓存
-        id: cache-restore
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            ~/.buildozer
-            app/.buildozer
-          key: buildozer-release-${{ hashFiles('app/buildozer.spec') }}
-          restore-keys: |
-            buildozer-release-
-            buildozer-
+          # ---- 版本号 ----
+          if [ -n "${{ inputs.tag }}" ]; then
+            TAG="${{ inputs.tag }}"
+          elif [ "${{ github.event_name }}" = "workflow_run" ]; then
+            # 用上游构建的短 SHA 做默认版本，避免重复 tag
+            SHA_SHORT=$(echo "${{ github.event.workflow_run.head_sha }}" | cut -c1-7)
+            TAG="build-${SHA_SHORT}"
+          else
+            TAG="build-$(date +%Y%m%d-%H%M)"
+          fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "版本号: $TAG"
 
-      - name: 打包 APK
-        working-directory: app
+          # ---- 来源 run id ----
+          if [ -n "${{ inputs.run_id }}" ]; then
+            RUN_ID="${{ inputs.run_id }}"
+          elif [ "${{ github.event_name }}" = "workflow_run" ]; then
+            RUN_ID="${{ github.event.workflow_run.id }}"
+          else
+            # 手动触发：取 master 上最近一次成功的 Build APK
+            RUN_ID=$(gh run list \
+              --workflow="Build APK" \
+              --branch=master \
+              --status=success \
+              --limit=1 \
+              --json databaseId \
+              --jq '.[0].databaseId')
+          fi
+          if [ -z "$RUN_ID" ] || [ "$RUN_ID" = "null" ]; then
+            echo "找不到可用的构建记录" >&2
+            exit 1
+          fi
+          echo "run_id=$RUN_ID" >> $GITHUB_OUTPUT
+          echo "来源 run: $RUN_ID"
+
+      - name: 下载已构建的 APK
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          yes | buildozer android debug
-
-      - name: 保存 Buildozer 缓存
-        if: always() && steps.cache-restore.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            ~/.buildozer
-            app/.buildozer
-          key: buildozer-release-${{ hashFiles('app/buildozer.spec') }}
-
-      - name: 整理产物
-        run: |
+          set -e
           mkdir -p dist
-          for f in app/bin/*.apk; do
-            [ -e "$f" ] || continue
-            base=$(basename "$f" .apk)
-            cp "$f" "dist/Fake_GPS_${{ steps.version.outputs.value }}.apk"
-            echo "已打包: dist/Fake_GPS_${{ steps.version.outputs.value }}.apk"
-          done
+          gh run download "${{ steps.meta.outputs.run_id }}" \
+            --name apk \
+            --dir dist
+          echo "下载完成："
           ls -lh dist/
 
-      - name: 生成校验和
+      - name: 重命名并生成校验和
         run: |
+          set -e
           cd dist
+          for f in *.apk; do
+            [ -e "$f" ] || { echo "没有找到 APK" >&2; exit 1; }
+            mv "$f" "Fake_GPS_${{ steps.meta.outputs.tag }}.apk"
+          done
           sha256sum *.apk > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
       - name: 创建 Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.version.outputs.value }}
-          name: Fake_GPS ${{ steps.version.outputs.value }}
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: Fake_GPS ${{ steps.meta.outputs.tag }}
           draft: false
           prerelease: false
           generate_release_notes: true
           body: |
-            ## 说明
-
-            Android 定位模拟工具，通过 PC 端发送坐标，手机端注入系统定位。
-
-            ### 安装
+            ## 安装
 
             1. 下载下方 APK 并安装
             2. 在开发者选项中将本应用设为「模拟位置信息应用」
             3. 打开应用，填写 PC 端 IP 和端口，点击「启动服务」
 
-            ### PC 端
+            ## PC 端
 
             ```bash
             cd server
@@ -188,27 +126,20 @@ jobs:
 
             浏览器打开 `http://127.0.0.1:8000`，在网页中选择 GPX 路径、设置速度和目标 IP。
 
-            ### 校验
-
-            下载 `SHA256SUMS.txt` 后执行：
+            ## 校验
 
             ```bash
             sha256sum -c SHA256SUMS.txt
             ```
 
-            ### 版本
+            ## 来源
 
-            本次构建基于提交 `${{ github.sha }}`。
+            本次 APK 来自构建 run `${{ steps.meta.outputs.run_id }}`，
+            对应提交 `${{ github.event.workflow_run.head_sha || github.sha }}`。
           files: |
             dist/*.apk
             dist/SHA256SUMS.txt
 
-  verify-release:
-    needs: build-android
-    runs-on: ubuntu-latest
-    steps:
-      - name: 确认 Release 已发布
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: 输出结果
         run: |
-          echo "Release 已创建：${{ github.server_url }}/${{ github.repository }}/releases"
+          echo "Release 已发布：${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ steps.meta.outputs.tag }}"
