@@ -1,0 +1,17 @@
+# PC 端依赖：server/ 目录只使用 Python 标准库，无需安装任何包。
+#
+# 手机端依赖由 buildozer.spec 的 requirements 字段管理：
+#   requirements = python3,kivy,pyjnius,kivy_garden.mapview
+# 不在本文件中声明，避免误装到 PC 环境。
+#
+# 如需在桌面上调试 app/main.py（不打包 APK），安装以下依赖：
+#   pip install -r requirements.txt
+#
+# PC 端仅运行 server/ 时，本文件可以不安装。
+
+kivy>=2.3.0
+kivy_garden.mapview>=1.0.4
+certifi>=2023.7.22
+
+# pyjnius 仅在 Android 上可用，桌面环境请勿安装：
+# pyjnius>=1.6.1

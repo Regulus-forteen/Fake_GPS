@@ -1,1 +1,43 @@
-/server/history.json
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# Buildozer 构建产物
+app/bin/
+app/.buildozer/
+.buildozer/
+app/for-build/
+*.apk
+*.aab
+
+# 运行时生成
+app/cache/
+app/state.json
+app/service.log
+server/history.json
+server/__pycache__/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# 系统
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 临时文件
+*.log
+*.tmp
+_*.py
+_*.txt
+_*.txt
