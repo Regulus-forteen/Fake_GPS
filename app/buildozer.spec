@@ -26,6 +26,7 @@ android.minapi = 26
 android.api = 34
 android.targetapi = 34
 android.archs = arm64-v8a, armeabi-v7a
+android.orientation = portrait
 android.logcat_filters = *:S python:D
 android.accept_sdk_license = True
 

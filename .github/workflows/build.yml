@@ -159,11 +159,18 @@ jobs:
         working-directory: app
         env:
           P4A_RELEASE_KEYSTORE: ${{ github.workspace }}/app/release.keystore
+          # 去掉可能混入的换行/回车，避免签名失败
           P4A_RELEASE_KEYSTORE_PASSWD: ${{ secrets.KEYSTORE_PASSWORD }}
           P4A_RELEASE_KEYALIAS: ${{ secrets.KEY_ALIAS }}
           P4A_RELEASE_KEYALIAS_PASSWD: ${{ secrets.KEY_PASSWORD }}
         run: |
           set -e
+          # Secret 里如果粘进了换行，会以 \n 结尾导致签名失败，这里清洗掉
+          P4A_RELEASE_KEYSTORE_PASSWD="$(printf '%s' "$P4A_RELEASE_KEYSTORE_PASSWD" | tr -d '\r\n')"
+          P4A_RELEASE_KEYALIAS_PASSWD="$(printf '%s' "$P4A_RELEASE_KEYALIAS_PASSWD" | tr -d '\r\n')"
+          export P4A_RELEASE_KEYSTORE_PASSWD P4A_RELEASE_KEYALIAS_PASSWD
+          echo "密码长度: keystore=${#P4A_RELEASE_KEYSTORE_PASSWD} alias=${#P4A_RELEASE_KEYALIAS_PASSWD}"
+
           yes | buildozer android release
           echo "--- 产物 ---"
           ls -lh bin/
