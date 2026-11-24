@@ -19,7 +19,7 @@ on:
 
 permissions:
   contents: write
-  actions: write
+  actions: read
 
 concurrency:
   group: release-${{ github.ref }}
