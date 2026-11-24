@@ -18,8 +18,6 @@ android.permissions = ACCESS_FINE_LOCATION, ACCESS_COARSE_LOCATION, ACCESS_MOCK_
 
 services = Receiver:service/main.py:foreground:foregroundServiceType=location
 
-# p4a.hook = for-build/p4a/hook.py
-
 android.minapi = 26
 android.api = 34
 android.targetapi = 34

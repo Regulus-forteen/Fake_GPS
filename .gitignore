@@ -14,7 +14,6 @@ env/
 app/bin/
 app/.buildozer/
 .buildozer/
-app/for-build/
 *.apk
 *.aab
 

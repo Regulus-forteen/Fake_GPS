@@ -1,0 +1,185 @@
+name: Check
+
+# 代码检查：语法、导入、格式、配置一致性
+# 不编译 APK，几秒内出结果，用于在 push / PR 时发现明显问题。
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  python-check:
+    name: Python 语法与风格
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安装检查工具
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff pyflakes
+
+      # 语法错误是硬伤，必须拦住
+      - name: 编译检查（语法错误）
+        run: |
+          python -m compileall -q app server || exit 1
+
+      # 未定义变量、重复导入等
+      - name: Pyflakes（未定义名称 / 未使用导入）
+        run: |
+          set +e
+          pyflakes app server 2>&1 | tee /tmp/pyflakes.log
+          # 只把「undefined name」当错误，未使用导入只警告
+          if grep -q "undefined name" /tmp/pyflakes.log; then
+            echo "::error::发现未定义名称，构建会失败"
+            exit 1
+          fi
+          echo "Pyflakes 检查通过（忽略未使用导入的提示）"
+
+      - name: Ruff（E9 致命错误）
+        run: |
+          ruff check --select=E9,F63,F7,F82 --output-format=github app server
+
+  config-check:
+    name: 配置一致性
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 检查 buildozer.spec 关键字段
+        run: |
+          set -e
+          SPEC=app/buildozer.spec
+          [ -f "$SPEC" ] || { echo "::error::缺少 $SPEC"; exit 1; }
+
+          fail() { echo "::error::$1"; exit 1; }
+
+          grep -qE '^title\s*=\s*\S' "$SPEC" || fail "缺少 title"
+          grep -qE '^package\.name\s*=\s*\S' "$SPEC" || fail "缺少 package.name"
+          grep -qE '^package\.domain\s*=\s*\S' "$SPEC" || fail "缺少 package.domain"
+          grep -qE '^version\s*=' "$SPEC" || fail "缺少 version"
+          grep -qE '^icon\.filename\s*=\s*\S' "$SPEC" || fail "缺少 icon.filename"
+          grep -qE '^presplash\.filename\s*=\s*\S' "$SPEC" || fail "缺少 presplash.filename"
+
+          # version 行只能有一行，多行会被 buildozer 取最后一个，容易踩坑
+          COUNT=$(grep -cE '^version\s*=' "$SPEC")
+          [ "$COUNT" -eq 1 ] || fail "version 行出现 $COUNT 次，应当只有 1 次"
+
+          # 包名不能是占位符
+          grep -q 'com.example' "$SPEC" && fail "package.domain 仍是 com.example 占位符"
+
+          # 引用的文件必须真实存在
+          ICON=$(grep -oP '(?<=^icon\.filename = ).*' "$SPEC")
+          [ -f "app/$ICON" ] || fail "icon.filename 指向的 app/$ICON 不存在"
+
+          SPLASH=$(grep -oP '(?<=^presplash\.filename = ).*' "$SPEC")
+          [ -f "app/$SPLASH" ] || fail "presplash.filename 指向的 app/$SPLASH 不存在"
+
+          echo "buildozer.spec 检查通过"
+
+      - name: 检查包名与代码中的 autoclass 一致
+        run: |
+          set -e
+          SPEC=app/buildozer.spec
+          NAME=$(grep -oP '(?<=^package\.name = ).*' "$SPEC")
+          DOMAIN=$(grep -oP '(?<=^package\.domain = ).*' "$SPEC")
+          FULL="$DOMAIN.$NAME"
+
+          echo "期望包名: $FULL"
+          if ! grep -rq "$FULL" app --include=*.py; then
+            echo "::warning::代码里没有找到包名 $FULL，检查 autoclass 调用是否同步"
+          else
+            echo "代码中的包名与 spec 一致"
+          fi
+
+          # 检查是否残留旧包名
+          if grep -rq "com.example" app --include=*.py; then
+            echo "::error::代码中仍残留 com.example 占位包名"
+            grep -rn "com.example" app --include=*.py
+            exit 1
+          fi
+
+      - name: 检查 workflow YAML 可解析
+        run: |
+          pip install pyyaml
+          python - <<'PY'
+          import glob, sys, yaml
+          ok = True
+          for f in glob.glob('.github/workflows/*.yml'):
+              try:
+                  yaml.safe_load(open(f, encoding='utf-8'))
+                  print(f'{f}: OK')
+              except Exception as e:
+                  print(f'::error file={f}::{e}')
+                  ok = False
+          sys.exit(0 if ok else 1)
+          PY
+
+  file-check:
+    name: 文件与仓库卫生
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 检查是否有文件被误提交
+        run: |
+          set -e
+          FAIL=0
+
+          # 运行时产物不该进仓库
+          for pat in "*.log" "app/state.json" "server/history.json" "*.apk"; do
+            found=$(git ls-files | grep -E "$(echo $pat | sed 's/\*/[^\/]*/g')" || true)
+            if [ -n "$found" ]; then
+              echo "::error::不应提交的文件（$pat）："
+              echo "$found"
+              FAIL=1
+            fi
+          done
+
+          # 大文件提醒（超过 5MB）
+          while IFS= read -r f; do
+            [ -f "$f" ] || continue
+            size=$(stat -c%s "$f" 2>/dev/null || echo 0)
+            if [ "$size" -gt 5242880 ]; then
+              echo "::warning file=$f::文件大于 5MB（$((size/1024/1024))MB），确认是否需要入库"
+            fi
+          done < <(git ls-files)
+
+          exit $FAIL
+
+      - name: 检查 Python 文件编码
+        run: |
+          set -e
+          python - <<'PY'
+          import pathlib
+          bad = []
+          for p in pathlib.Path('.').rglob('*.py'):
+              if any(x in p.parts for x in ('.git', '.venv', 'build', '.buildozer')):
+                  continue
+              try:
+                  p.read_text(encoding='utf-8')
+              except UnicodeDecodeError:
+                  bad.append(str(p))
+          if bad:
+              for b in bad:
+                  print(f'::error file={b}::不是 UTF-8 编码')
+              raise SystemExit(1)
+          print('所有 Python 文件均为 UTF-8')
+          PY
