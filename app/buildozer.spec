@@ -18,7 +18,7 @@ source.include_exts = py,png,jpg,kv,atlas,ttf
 
 requirements = python3,kivy,pyjnius,kivy_garden.mapview
 
-android.permissions = ACCESS_FINE_LOCATION, ACCESS_COARSE_LOCATION, ACCESS_MOCK_LOCATION, FOREGROUND_SERVICE, FOREGROUND_SERVICE_LOCATION, POST_NOTIFICATIONS, INTERNET
+android.permissions = ACCESS_FINE_LOCATION, ACCESS_COARSE_LOCATION, FOREGROUND_SERVICE, FOREGROUND_SERVICE_LOCATION, POST_NOTIFICATIONS, INTERNET
 
 services = Receiver:service/main.py:foreground:foregroundServiceType=location
 
@@ -26,7 +26,7 @@ android.minapi = 26
 android.api = 34
 android.targetapi = 34
 android.archs = arm64-v8a, armeabi-v7a
-android.orientation = portrait
+orientation = portrait
 android.logcat_filters = *:S python:D
 android.accept_sdk_license = True
 
