@@ -1,0 +1,234 @@
+name: Build
+
+# 只负责构建，产物上传为 artifact「apk」。
+#   平时 push（改 app/）→ debug 签名，供日常测试
+#   由 Release workflow 调用 → release 签名，供正式发版
+
+on:
+  # 只由 Release workflow 调用，不再单独响应 push，
+  # 避免 app/ 变更时重复构建两次。
+  workflow_call:
+    inputs:
+      sign:
+        description: '签名方式'
+        required: false
+        type: string
+        default: 'debug'
+      version:
+        description: '写入 buildozer.spec 的版本号（如 1.0.0）'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  build-android:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: 决定签名方式
+        id: sign
+        env:
+          INPUT_SIGN: ${{ inputs.sign }}
+          HAS_KEYSTORE: ${{ secrets.KEYSTORE_BASE64 != '' }}
+        run: |
+          MODE="${INPUT_SIGN:-debug}"
+
+          # 要求正式签名但没配密钥 → 直接报错，不要静默降级
+          if [ "$MODE" = "release" ] && [ "$HAS_KEYSTORE" != "true" ]; then
+            echo "::error::要求正式签名，但未配置 KEYSTORE_BASE64 等 secrets"
+            exit 1
+          fi
+
+          echo "mode=$MODE" >> $GITHUB_OUTPUT
+          echo "签名方式: $MODE"
+
+          if [ -n "${{ inputs.version }}" ]; then
+            echo "version=${{ inputs.version }}" >> $GITHUB_OUTPUT
+            echo "版本号: ${{ inputs.version }}"
+          else
+            echo "version=" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 准备签名密钥
+        if: steps.sign.outputs.mode == 'release'
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          set -e
+          echo "$KEYSTORE_BASE64" | base64 -d > app/release.keystore
+          SIZE=$(stat -c%s app/release.keystore)
+          echo "keystore 已还原：${SIZE} 字节"
+          [ "$SIZE" -gt 1000 ] || { echo "::error::keystore 内容异常"; exit 1; }
+
+      - name: 写入版本号
+        if: steps.sign.outputs.version != ''
+        run: |
+          set -e
+          VER="${{ steps.sign.outputs.version }}"
+          echo "写入 buildozer.spec version = $VER"
+          python3 - "$VER" <<'PY'
+          import re, sys
+          ver = sys.argv[1]
+          path = 'app/buildozer.spec'
+          src = open(path, encoding='utf-8').read()
+          new, n = re.subn(r'(?m)^version\s*=.*$', f'version = {ver}', src)
+          assert n == 1, f'version 行数量异常: {n}'
+          open(path, 'w', encoding='utf-8').write(new)
+          PY
+          grep -E '^version\s*=' app/buildozer.spec
+
+      - name: 释放磁盘空间
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android/sdk/ndk
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf /usr/share/swift
+          sudo rm -rf /usr/local/lib/node_modules
+          sudo rm -rf /opt/hostedtoolcache/PyPy
+          sudo rm -rf /opt/hostedtoolcache/node
+          sudo apt-get clean
+          df -h /
+
+      - name: 安装系统依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git zip unzip openjdk-17-jdk \
+            autoconf automake libtool libtool-bin \
+            libltdl-dev pkg-config gettext \
+            zlib1g-dev libncurses-dev cmake \
+            libffi-dev libssl-dev
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11.5'
+
+      - name: 切换到 Java 17
+        run: |
+          echo "JAVA_HOME=/usr/lib/jvm/temurin-17-jdk-amd64" >> $GITHUB_ENV
+          echo "PATH=/usr/lib/jvm/temurin-17-jdk-amd64/bin:$PATH" >> $GITHUB_ENV
+          java -version
+
+      - name: 安装 Buildozer 和 Cython
+        run: |
+          pip install --upgrade pip
+          pip install buildozer cython==0.29.36
+
+      - name: 手动 clone p4a master 并 patch pip 升级
+        working-directory: app
+        run: |
+          set -e
+          P4A_DIR=".buildozer/android/platform/python-for-android"
+          mkdir -p "$(dirname "$P4A_DIR")"
+          rm -rf "$P4A_DIR"
+          git clone --depth=1 -b master \
+            https://github.com/kivy/python-for-android.git "$P4A_DIR"
+          cd "$P4A_DIR"
+          python3 -c "
+          path = 'pythonforandroid/build.py'
+          src = open(path).read()
+          old = '\"source venv/bin/activate && pip install -U pip\"'
+          new = '\"source venv/bin/activate\"'
+          assert old in src, '目标代码未找到'
+          open(path, 'w').write(src.replace(old, new))
+          print('✅ 补丁成功')
+          "
+
+      - name: 恢复 Buildozer 缓存
+        id: cache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.buildozer
+            app/.buildozer
+          key: buildozer-${{ hashFiles('app/buildozer.spec') }}
+          restore-keys: |
+            buildozer-
+
+      - name: 打包 APK（发布签名）
+        if: steps.sign.outputs.mode == 'release'
+        working-directory: app
+        env:
+          P4A_RELEASE_KEYSTORE: ${{ github.workspace }}/app/release.keystore
+          P4A_RELEASE_KEYSTORE_PASSWD: ${{ secrets.KEYSTORE_PASSWORD }}
+          P4A_RELEASE_KEYALIAS: ${{ secrets.KEY_ALIAS }}
+          P4A_RELEASE_KEYALIAS_PASSWD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -e
+          yes | buildozer android release
+          echo "--- 产物 ---"
+          ls -lh bin/
+
+      - name: 打包 APK（debug 签名）
+        if: steps.sign.outputs.mode != 'release'
+        working-directory: app
+        run: |
+          set -e
+          yes | buildozer android debug
+          echo "--- 产物 ---"
+          ls -lh bin/
+
+      - name: 保存 Buildozer 缓存（仅当缓存未命中）
+        if: always() && steps.cache-restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.buildozer
+            app/.buildozer
+          key: buildozer-${{ hashFiles('app/buildozer.spec') }}
+
+      - name: 清理旧缓存
+        if: always() && steps.cache-restore.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          CURRENT_KEY="buildozer-${{ hashFiles('app/buildozer.spec') }}"
+          echo "保留: $CURRENT_KEY"
+          gh cache list --limit 100 --json id,key | \
+            python3 -c "
+          import json, sys
+          data = json.load(sys.stdin)
+          current = '$CURRENT_KEY'
+          for c in data:
+              if c['key'].startswith('buildozer-') and c['key'] != current:
+                  print(c['id'])
+          " | while read cid; do
+              [ -n "$cid" ] && gh cache delete "$cid" || true
+            done
+          gh cache list --limit 100 || true
+
+      - name: 校验签名
+        if: steps.sign.outputs.mode == 'release'
+        working-directory: app
+        run: |
+          set -e
+          APKS=$(ls bin/*.apk 2>/dev/null || true)
+          [ -n "$APKS" ] || { echo "::error::没有生成 APK"; exit 1; }
+
+          SIGNER=$(find "$ANDROID_HOME/build-tools" -name apksigner -type f 2>/dev/null | sort -V | tail -1 || true)
+          for apk in $APKS; do
+            echo "=== $apk ==="
+            if [ -n "$SIGNER" ]; then
+              "$SIGNER" verify --print-certs "$apk" | head -20
+            else
+              unzip -l "$apk" | grep -E "META-INF/(CERT|.*\\.RSA)" || {
+                echo "::error::$apk 未签名"; exit 1; }
+            fi
+          done
+
+      - name: 上传 APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk
+          path: app/bin/*.apk
