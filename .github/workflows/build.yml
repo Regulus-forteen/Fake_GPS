@@ -1,8 +1,8 @@
 name: Build
 
 # 只负责构建，产物上传为 artifact「apk」。
-#   平时 push（改 app/）→ debug 签名，供日常测试
-#   由 Release workflow 调用 → release 签名，供正式发版
+# 平时 push（改 app/）→ debug 签名，供日常测试
+# 由 Release workflow 调用 → release 签名，供正式发版
 
 on:
   # 只由 Release workflow 调用，不再单独响应 push，
@@ -133,15 +133,7 @@ jobs:
           git clone --depth=1 -b master \
             https://github.com/kivy/python-for-android.git "$P4A_DIR"
           cd "$P4A_DIR"
-          python3 -c "
-          path = 'pythonforandroid/build.py'
-          src = open(path).read()
-          old = '\"source venv/bin/activate && pip install -U pip\"'
-          new = '\"source venv/bin/activate\"'
-          assert old in src, '目标代码未找到'
-          open(path, 'w').write(src.replace(old, new))
-          print('✅ 补丁成功')
-          "
+          python3 -c " path = 'pythonforandroid/build.py' src = open(path).read() old = '\"source venv/bin/activate && pip install -U pip\"' new = '\"source venv/bin/activate\"' assert old in src, '目标代码未找到' open(path, 'w').write(src.replace(old, new)) print('✅ 补丁成功') "
 
       - name: 恢复 Buildozer 缓存
         id: cache-restore
@@ -201,14 +193,7 @@ jobs:
           CURRENT_KEY="buildozer-${{ hashFiles('app/buildozer.spec') }}"
           echo "保留: $CURRENT_KEY"
           gh cache list --limit 100 --json id,key | \
-            python3 -c "
-          import json, sys
-          data = json.load(sys.stdin)
-          current = '$CURRENT_KEY'
-          for c in data:
-              if c['key'].startswith('buildozer-') and c['key'] != current:
-                  print(c['id'])
-          " | while read cid; do
+            python3 -c " import json, sys data = json.load(sys.stdin) current = '$CURRENT_KEY' for c in data: if c['key'].startswith('buildozer-') and c['key'] != current: print(c['id']) " | while read cid; do
               [ -n "$cid" ] && gh cache delete "$cid" || true
             done
           gh cache list --limit 100 || true
@@ -221,15 +206,32 @@ jobs:
           APKS=$(ls bin/*.apk 2>/dev/null || true)
           [ -n "$APKS" ] || { echo "::error::没有生成 APK"; exit 1; }
 
+          # 找 apksigner（build-tools 里，版本号最大的那个）
           SIGNER=$(find "$ANDROID_HOME/build-tools" -name apksigner -type f 2>/dev/null | sort -V | tail -1 || true)
+          if [ -z "$SIGNER" ]; then
+            echo "::error::找不到 apksigner"
+            exit 1
+          fi
+          echo "使用 apksigner: $SIGNER"
+
           for apk in $APKS; do
             echo "=== $apk ==="
-            if [ -n "$SIGNER" ]; then
-              "$SIGNER" verify --print-certs "$apk" | head -20
-            else
-              unzip -l "$apk" | grep -E "META-INF/(CERT|.*\\.RSA)" || {
-                echo "::error::$apk 未签名"; exit 1; }
+
+            # apksigner verify 退出码非 0 即为签名无效（支持 v1/v2/v3）
+            if ! "$SIGNER" verify --verbose --print-certs "$apk"; then
+              echo "::error::$apk 签名校验失败"
+              exit 1
             fi
+
+            # 从证书里确认不是调试证书
+            CERT=$("$SIGNER" verify --print-certs "$apk" 2>/dev/null)
+            if echo "$CERT" | grep -qi "Android Debug"; then
+              echo "::error::$apk 使用的是调试证书，不能作为正式版发布"
+              exit 1
+            fi
+
+            echo "$CERT" | grep -iE "Signer #1 certificate DN|SHA-256 digest" || true
+            echo "签名校验通过"
           done
 
       - name: 上传 APK
