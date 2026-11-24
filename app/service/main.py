@@ -1,14 +1,8 @@
 """
 前台服务（跨平台）
-- Android: 监听 TCP + 注入 GPS/Network + 每100ms高频写 + 写 state.json
-- 桌面: 监听 TCP + 只写 state.json
-
-对齐影梭（GoGoGo）的实现：
-- 只注册 GPS + NETWORK
-- GPS / NETWORK 分别用不同参数
-- Location 带 satellites / bearing / speed
-- 独立线程每 100ms 无条件写一遍
-- 持有 PARTIAL_WAKE_LOCK，防止后台被冻结
+- 监听 TCP + 注入 GPS/Network + 每100ms高频写
+- 定期检查 mock provider 是否被系统移除，被移除立即重建
+- 持有 PARTIAL_WAKE_LOCK 防止后台被冻结
 """
 import os
 import sys
@@ -86,7 +80,6 @@ def get_state_file_path():
     )
 
 
-# Java 常量
 GPS_PROVIDER = "gps"
 NETWORK_PROVIDER = "network"
 
@@ -107,17 +100,18 @@ class GpsServer:
         self.foreground_ok = False
         self._last_status = "starting"
 
-        # 当前注入坐标
         self.cur_lat = 39.9042
         self.cur_lon = 116.4074
         self.cur_alt = 55.0
         self.cur_bearing = 0.0
         self.cur_speed = 1.2
 
-        # 高频写入线程
         self._inject_thread = None
-        # WakeLock
+        self._guard_thread = None
         self._wake_lock = None
+
+        # 记录重建次数（用于日志）
+        self._rebuild_count = 0
 
         if IS_ANDROID and jnius is not None:
             try:
@@ -135,7 +129,7 @@ class GpsServer:
                 self.lm = None
 
     # ========================================================
-    # WakeLock：防止后台被冻结
+    # WakeLock
     # ========================================================
     def acquire_wakelock(self):
         if not IS_ANDROID or jnius is None:
@@ -172,6 +166,7 @@ class GpsServer:
                 "timestamp": time.time(),
                 "port": self.port,
                 "foreground": self.foreground_ok,
+                "rebuild": self._rebuild_count,
             }
             if lat is not None and lon is not None:
                 data["lat"] = lat
@@ -252,8 +247,21 @@ class GpsServer:
             self.foreground_ok = False
 
     # ========================================================
-    # Provider 注册
+    # Provider 注册 / 移除
     # ========================================================
+    def _is_mock_present(self, name):
+        """检查 mock provider 是否还在（通过尝试写入）"""
+        try:
+            Location = jnius('android.location.Location')
+            loc = Location(name)
+            loc.setLatitude(self.cur_lat)
+            loc.setLongitude(self.cur_lon)
+            loc.setTime(int(time.time() * 1000))
+            self.lm.setTestProviderLocation(name, loc)
+            return True
+        except Exception:
+            return False
+
     def _remove_provider(self, name):
         try:
             if self.lm.isProviderEnabled(name):
@@ -269,10 +277,7 @@ class GpsServer:
             if sdk_int >= 31:
                 self.lm.addTestProvider(
                     GPS_PROVIDER,
-                    False,  # requiresNetwork
-                    True,   # requiresSatellite
-                    False,  # requiresCell
-                    False,  # hasMonetaryCost
+                    False, True, False, False,
                     True, True, True,
                     POWER_USAGE_HIGH,
                     ACCURACY_FINE
@@ -288,10 +293,8 @@ class GpsServer:
                 )
             if not self.lm.isProviderEnabled(GPS_PROVIDER):
                 self.lm.setTestProviderEnabled(GPS_PROVIDER, True)
-            _log("[Service] gps provider 注册成功")
             return True
-        except Exception as e:
-            _log(f"[Service] gps provider 注册失败: {e}")
+        except Exception:
             return False
 
     def _add_network_provider(self):
@@ -301,10 +304,7 @@ class GpsServer:
             if sdk_int >= 31:
                 self.lm.addTestProvider(
                     NETWORK_PROVIDER,
-                    True,   # requiresNetwork
-                    False,  # requiresSatellite
-                    True,   # requiresCell
-                    True,   # hasMonetaryCost
+                    True, False, True, True,
                     True, True, True,
                     POWER_USAGE_LOW,
                     ACCURACY_COARSE
@@ -320,10 +320,8 @@ class GpsServer:
                 )
             if not self.lm.isProviderEnabled(NETWORK_PROVIDER):
                 self.lm.setTestProviderEnabled(NETWORK_PROVIDER, True)
-            _log("[Service] network provider 注册成功")
             return True
-        except Exception as e:
-            _log(f"[Service] network provider 注册失败: {e}")
+        except Exception:
             return False
 
     def setup_provider(self):
@@ -343,13 +341,12 @@ class GpsServer:
             self.provider_ready = True
             self._last_status = "provider_ready"
             self.write_state(status="provider_ready")
-            # 注册完立即写一次，覆盖系统缓存
             try:
                 self._write_location_gps()
                 self._write_location_network()
-                _log("[Service] 初始化位置已写入")
-            except Exception as e:
-                _log(f"[Service] 初始写入失败: {e}")
+            except Exception:
+                pass
+            _log(f"[Service] provider 就绪 gps={ok1} network={ok2}")
         else:
             self.provider_ready = False
             self._last_status = "provider_error"
@@ -357,7 +354,7 @@ class GpsServer:
                              extra={"error": "all providers failed"})
 
     # ========================================================
-    # 单次写入位置
+    # 单次写入
     # ========================================================
     def _write_location_gps(self):
         try:
@@ -376,7 +373,7 @@ class GpsServer:
             loc.setElapsedRealtimeNanos(SystemClock.elapsedRealtimeNanos())
 
             bundle = Bundle()
-            bundle.putInt("satellites", 7)          # 改回 7，避免冲突
+            bundle.putInt("satellites", 7)
             try:
                 bundle.putFloat("maxCn0", 38.0)
                 bundle.putFloat("meanCn0", 28.0)
@@ -386,8 +383,7 @@ class GpsServer:
 
             self.lm.setTestProviderLocation(GPS_PROVIDER, loc)
             return True
-        except Exception as e:
-            _log(f"[Service] GPS 写入失败: {e}")
+        except Exception:
             return False
 
     def _write_location_network(self):
@@ -407,8 +403,7 @@ class GpsServer:
 
             self.lm.setTestProviderLocation(NETWORK_PROVIDER, loc)
             return True
-        except Exception as e:
-            _log(f"[Service] NETWORK 写入失败: {e}")
+        except Exception:
             return False
 
     # ========================================================
@@ -430,6 +425,36 @@ class GpsServer:
             _log("[Service] 高频注入线程已启动")
 
     # ========================================================
+    # 守 provider 线程：每 3 秒检查 mock 是否被系统移除
+    # ========================================================
+    def _guard_loop(self):
+        while self.running:
+            time.sleep(3)
+            if not self.running:
+                break
+            if not IS_ANDROID or jnius is None:
+                continue
+            try:
+                gps_ok = self._is_mock_present(GPS_PROVIDER)
+                net_ok = self._is_mock_present(NETWORK_PROVIDER)
+                if not (gps_ok and net_ok):
+                    self._rebuild_count += 1
+                    _log(f"[Guard] 检测到 mock 丢失 "
+                         f"(gps={gps_ok}, net={net_ok})，重建第 "
+                         f"{self._rebuild_count} 次")
+                    self.setup_provider()
+            except Exception as e:
+                _log(f"[Guard] 检查失败: {e}")
+
+    def start_guard_loop(self):
+        if self._guard_thread is None:
+            self._guard_thread = threading.Thread(
+                target=self._guard_loop, daemon=True
+            )
+            self._guard_thread.start()
+            _log("[Service] 守 provider 线程已启动（每 3 秒检查）")
+
+    # ========================================================
     def inject(self, lat, lon):
         if not self.provider_ready:
             return
@@ -441,8 +466,6 @@ class GpsServer:
 
     def serve(self):
         self.write_state(status="starting")
-
-        # 先请求 WakeLock，防止后台被冻结
         self.acquire_wakelock()
 
         try:
@@ -481,6 +504,11 @@ class GpsServer:
             self.start_inject_loop()
         except Exception as e:
             _log(f"[Service] start_inject_loop 外层异常: {e}")
+
+        try:
+            self.start_guard_loop()
+        except Exception as e:
+            _log(f"[Service] start_guard_loop 外层异常: {e}")
 
         try:
             while self.running:
