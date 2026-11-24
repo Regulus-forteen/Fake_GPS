@@ -347,7 +347,7 @@ HTML = r"""<!DOCTYPE html>
   </details>
 
   <div class="row" style="margin-top:8px;">
-    <button id="start">开始回放</button>
+    <button id="start">开始模拟</button>
     <button id="stop">停止</button>
   </div>
 
