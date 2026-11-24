@@ -25,7 +25,7 @@ def _get_state_dir():
                 return PythonService.mService.getFilesDir().getAbsolutePath()
         except Exception:
             pass
-        return '/data/data/com.example.gpsreceiver/files'
+        return '/data/data/com.regulus14.fakegps/files'
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -73,7 +73,7 @@ def get_state_file_path():
                     return p
         except Exception:
             pass
-        return '/data/data/com.example.gpsreceiver/files/state.json'
+        return '/data/data/com.regulus14.fakegps/files/state.json'
     return os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         'state.json'
@@ -140,7 +140,7 @@ class GpsServer:
             pm = self.service.getSystemService(Context.POWER_SERVICE)
             self._wake_lock = pm.newWakeLock(
                 PowerManager.PARTIAL_WAKE_LOCK,
-                "gpsreceiver::InjectLoop"
+                "fakegps::InjectLoop"
             )
             self._wake_lock.acquire()
             _log("[Service] WakeLock 已获取")

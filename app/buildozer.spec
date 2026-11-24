@@ -1,12 +1,16 @@
 [app]
-title = GPS Receiver
-package.name = gpsreceiver
-package.domain = com.example
+title = Fake GPS
+package.name = fakegps
+package.domain = com.regulus14
+
+version = 0.1
+
+# 图标与启动图（相对 buildozer.spec 所在目录）
+icon.filename = icon.png
+presplash.filename = presplash.png
 
 source.dir = .
 source.include_exts = py,png,jpg,kv,atlas,ttf
-
-version = 0.1
 
 requirements = python3,kivy,pyjnius,kivy_garden.mapview
 

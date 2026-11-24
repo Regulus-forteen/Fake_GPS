@@ -241,7 +241,7 @@ def get_state_file_path():
             return os.path.join(files_dir, 'state.json')
         except Exception as e:
             print(f"[Path] mActivity 失败: {e}")
-        return '/data/data/com.example.gpsreceiver/files/state.json'
+        return '/data/data/com.regulus14.fakegps/files/state.json'
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), 'state.json')
 
 
@@ -882,7 +882,7 @@ class ReceiverUI(FloatLayout):
         if IS_ANDROID:
             try:
                 from jnius import autoclass
-                service = autoclass('com.example.gpsreceiver.ServiceReceiver')
+                service = autoclass('com.regulus14.fakegps.ServiceReceiver')
                 PythonActivity = autoclass('org.kivy.android.PythonActivity')
                 service.start(PythonActivity.mActivity, str(port))
                 print(f"[Service] service.start() 调用成功, port={port}")
@@ -913,7 +913,7 @@ class ReceiverUI(FloatLayout):
         if IS_ANDROID:
             try:
                 from jnius import autoclass
-                service = autoclass('com.example.gpsreceiver.ServiceReceiver')
+                service = autoclass('com.regulus14.fakegps.ServiceReceiver')
                 PythonActivity = autoclass('org.kivy.android.PythonActivity')
                 service.stop(PythonActivity.mActivity)
                 print("[Service] service.stop() 调用成功")
