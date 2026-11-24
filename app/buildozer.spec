@@ -9,6 +9,10 @@ version = 0.1
 icon.filename = icon.png
 presplash.filename = presplash.png
 
+# 发布签名类型
+android.release_artifact = apk
+android.debug_artifact = apk
+
 source.dir = .
 source.include_exts = py,png,jpg,kv,atlas,ttf
 
