@@ -2,8 +2,8 @@ name: Release
 
 # 两条发布路径，本 workflow 自己负责构建，不依赖 Build APK 的自动产物。
 #
-#   1. push 改了 app/ → 自动构建（debug 签名）→ 发 Prerelease（tag: build-<sha>）
-#   2. 手动填版本号 → 重新构建（release 签名）→ 发正式 Release 并设为 latest
+# 1. push 改了 app/ → 自动构建（debug 签名）→ 发 Prerelease（tag: build-<sha>）
+# 2. 手动填版本号 → 重新构建（release 签名）→ 发正式 Release 并设为 latest
 
 on:
   push:
